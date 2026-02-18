@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -13,6 +15,7 @@ import (
 	"github.com/openclaw/mroute/internal/api"
 	"github.com/openclaw/mroute/internal/config"
 	"github.com/openclaw/mroute/internal/flow"
+	"github.com/openclaw/mroute/internal/monitor"
 	"github.com/openclaw/mroute/internal/telegram"
 	"github.com/openclaw/mroute/internal/transport"
 )
@@ -30,8 +33,10 @@ func main() {
 
 	bot := telegram.NewBot(cfg.Telegram.BotToken, cfg.Telegram.ChatID)
 	engine := transport.NewEngine(cfg.FFmpeg.Path, cfg.FFmpeg.MaxFlows)
+	engine.SetFFprobePath(cfg.FFmpeg.ProbePath)
+	mon := monitor.NewMonitor(cfg.FFmpeg.Path, cfg.FFmpeg.ProbePath)
 
-	mgr, err := flow.NewManager(cfg.Storage.DSN, engine)
+	mgr, err := flow.NewManager(cfg.Storage.DSN, engine, mon)
 	if err != nil {
 		log.Fatalf("flow manager: %v", err)
 	}
@@ -46,7 +51,7 @@ func main() {
 	srv := api.NewServer(addr, mgr)
 
 	go func() {
-		if err := srv.Start(); err != nil {
+		if err := srv.Start(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Printf("server: %v", err)
 		}
 	}()
@@ -61,6 +66,7 @@ func main() {
 	log.Println("shutting down...")
 	bot.NotifyShutdown()
 
+	mon.StopAll()
 	engine.StopAll()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)

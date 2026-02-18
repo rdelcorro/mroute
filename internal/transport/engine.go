@@ -14,24 +14,27 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/openclaw/mroute/internal/merge"
 	"github.com/openclaw/mroute/pkg/types"
 )
 
 // Engine manages FFmpeg-based live transport for flows
 type Engine struct {
-	ffmpegPath string
-	maxFlows   int
-	sessions   map[string]*Session
-	mu         sync.Mutex // use full Mutex (not RWMutex) for simpler concurrent safety
-	onEvent    func(flowID, eventType, message, severity string)
-	eventMu    sync.RWMutex // protects onEvent callback
+	ffmpegPath  string
+	ffprobePath string
+	maxFlows    int
+	sessions    map[string]*Session
+	mu          sync.Mutex
+	onEvent     func(flowID, eventType, message, severity string)
+	eventMu     sync.RWMutex
+	nextMergePort int // allocator for merge output ports
 }
 
 // Session represents a running flow's transport session
 type Session struct {
 	FlowID        string
 	Flow          *types.Flow
-	ActiveSource  string // name of active source
+	ActiveSource  string
 	Cmd           *exec.Cmd
 	Cancel        context.CancelFunc
 	Ctx           context.Context
@@ -39,17 +42,33 @@ type Session struct {
 	Started       time.Time
 	FailoverCount int64
 	SourceHealth  map[string]*SourceHealth
-	stopping      bool // marks session as being stopped
+	OutputHealth  map[string]*OutputHealth
+	Merger        *merge.RTPMerger // non-nil in MERGE mode
+	stopping      bool
 	mu            sync.RWMutex
 }
 
 // SourceHealth tracks the liveness of a source
 type SourceHealth struct {
-	Name         string
-	Connected    bool
-	LastDataTime time.Time
-	BitrateKbps  int64
-	Errors       int64
+	Name             string
+	Connected        bool
+	LastDataTime     time.Time
+	BitrateKbps      int64
+	PacketsReceived  int64
+	PacketsLost      int64
+	PacketsRecovered int64
+	RoundTripTimeMs  int64
+	JitterMs         int64
+	Errors           int64
+}
+
+// OutputHealth tracks the status of an output
+type OutputHealth struct {
+	Name           string
+	Connected      bool
+	BitrateKbps    int64
+	PacketsSent    int64
+	Disconnections int64
 }
 
 func NewEngine(ffmpegPath string, maxFlows int) *Engine {
@@ -57,10 +76,16 @@ func NewEngine(ffmpegPath string, maxFlows int) *Engine {
 		maxFlows = 20
 	}
 	return &Engine{
-		ffmpegPath: ffmpegPath,
-		maxFlows:   maxFlows,
-		sessions:   make(map[string]*Session),
+		ffmpegPath:    ffmpegPath,
+		ffprobePath:   "ffprobe",
+		maxFlows:      maxFlows,
+		sessions:      make(map[string]*Session),
+		nextMergePort: 17000, // merge output ports start here
 	}
+}
+
+func (e *Engine) SetFFprobePath(path string) {
+	e.ffprobePath = path
 }
 
 func (e *Engine) SetEventCallback(cb func(flowID, eventType, message, severity string)) {
@@ -69,26 +94,27 @@ func (e *Engine) SetEventCallback(cb func(flowID, eventType, message, severity s
 	e.eventMu.Unlock()
 }
 
+// allocMergePort returns a unique local port for merge output
+func (e *Engine) allocMergePort() int {
+	port := e.nextMergePort
+	e.nextMergePort++
+	return port
+}
+
 // StartFlow starts live transport for a flow.
-// The flow is deep-copied so the caller can safely mutate the original.
 func (e *Engine) StartFlow(flow *types.Flow) error {
-	// Deep-copy the flow to avoid data races with the caller
 	flowCopy := flow.DeepCopy()
 
-	// Determine initial source before locking
-	activeSource := e.pickActiveSource(flowCopy)
-	if activeSource == nil {
+	allSources := e.allSources(flowCopy)
+	if len(allSources) == 0 {
 		return fmt.Errorf("no source configured for flow %s", flowCopy.ID)
 	}
 
-	// Hold lock for entire check-and-insert to prevent TOCTOU race
 	e.mu.Lock()
 	if _, exists := e.sessions[flowCopy.ID]; exists {
 		e.mu.Unlock()
 		return fmt.Errorf("flow %s is already running", flowCopy.ID)
 	}
-
-	// Enforce MaxFlows limit
 	if len(e.sessions) >= e.maxFlows {
 		e.mu.Unlock()
 		return fmt.Errorf("maximum concurrent flows reached (%d)", e.maxFlows)
@@ -98,23 +124,37 @@ func (e *Engine) StartFlow(flow *types.Flow) error {
 	sess := &Session{
 		FlowID:       flowCopy.ID,
 		Flow:         flowCopy,
-		ActiveSource: activeSource.Name,
 		Cancel:       cancel,
 		Ctx:          ctx,
 		Done:         make(chan struct{}),
 		Started:      time.Now(),
 		SourceHealth: make(map[string]*SourceHealth),
+		OutputHealth: make(map[string]*OutputHealth),
 	}
 
-	// Init health tracking for all sources
-	for _, src := range e.allSources(flowCopy) {
+	// Init health tracking
+	for _, src := range allSources {
 		sess.SourceHealth[src.Name] = &SourceHealth{Name: src.Name}
+	}
+	for _, out := range flowCopy.Outputs {
+		sess.OutputHealth[out.Name] = &OutputHealth{Name: out.Name}
+	}
+
+	// Determine active source
+	activeSource := e.pickActiveSource(flowCopy)
+	if activeSource != nil {
+		sess.ActiveSource = activeSource.Name
 	}
 
 	e.sessions[flowCopy.ID] = sess
 	e.mu.Unlock()
 
-	go e.runSession(sess)
+	// Choose session mode based on failover config
+	if e.isMergeMode(flowCopy) && len(allSources) >= 2 {
+		go e.runMergeSession(sess)
+	} else {
+		go e.runFailoverSession(sess)
+	}
 	return nil
 }
 
@@ -126,7 +166,6 @@ func (e *Engine) StopFlow(flowID string) error {
 		e.mu.Unlock()
 		return fmt.Errorf("flow %s is not running", flowID)
 	}
-	// Mark as stopping to prevent double-stop
 	sess.mu.Lock()
 	if sess.stopping {
 		sess.mu.Unlock()
@@ -139,22 +178,19 @@ func (e *Engine) StopFlow(flowID string) error {
 
 	sess.Cancel()
 
-	// runFFmpeg sends SIGTERM and waits 5s before SIGKILL,
-	// so we allow 15s total for graceful shutdown
 	select {
 	case <-sess.Done:
 	case <-time.After(15 * time.Second):
 		log.Printf("[flow:%s] stop timed out", flowID)
+		// Force cleanup if timed out (goroutine may be stuck)
+		e.mu.Lock()
+		delete(e.sessions, flowID)
+		e.mu.Unlock()
 	}
-
-	e.mu.Lock()
-	delete(e.sessions, flowID)
-	e.mu.Unlock()
 
 	return nil
 }
 
-// IsRunning returns whether a flow is actively transporting
 func (e *Engine) IsRunning(flowID string) bool {
 	e.mu.Lock()
 	_, ok := e.sessions[flowID]
@@ -180,22 +216,55 @@ func (e *Engine) GetMetrics(flowID string) *types.FlowMetrics {
 		Status:        types.FlowActive,
 		UptimeSeconds: int64(time.Since(sess.Started).Seconds()),
 		FailoverCount: sess.FailoverCount,
+		MergeActive:   sess.Merger != nil,
 		Timestamp:     time.Now(),
 	}
 
 	for _, sh := range sess.SourceHealth {
-		m.SourceMetrics = append(m.SourceMetrics, &types.SourceMetrics{
-			Name:        sh.Name,
-			Connected:   sh.Connected,
-			Status:      boolToStatus(sh.Connected),
-			BitrateKbps: sh.BitrateKbps,
-		})
+		sm := &types.SourceMetrics{
+			Name:             sh.Name,
+			Connected:        sh.Connected,
+			Status:           boolToStatus(sh.Connected),
+			BitrateKbps:      sh.BitrateKbps,
+			PacketsReceived:  sh.PacketsReceived,
+			PacketsLost:      sh.PacketsLost,
+			PacketsRecovered: sh.PacketsRecovered,
+			RoundTripTimeMs:  sh.RoundTripTimeMs,
+			JitterMs:         sh.JitterMs,
+			SourceSelected:   sh.Name == sess.ActiveSource,
+			MergeActive:      sess.Merger != nil,
+		}
+		m.SourceMetrics = append(m.SourceMetrics, sm)
+	}
+
+	for _, oh := range sess.OutputHealth {
+		om := &types.OutputMetrics{
+			Name:           oh.Name,
+			Connected:      oh.Connected,
+			Status:         boolToStatus(oh.Connected),
+			BitrateKbps:    oh.BitrateKbps,
+			PacketsSent:    oh.PacketsSent,
+			Disconnections: oh.Disconnections,
+		}
+		m.OutputMetrics = append(m.OutputMetrics, om)
+	}
+
+	// Merge stats
+	if sess.Merger != nil {
+		stats := sess.Merger.Stats()
+		m.MergeStats = &types.MergeMetrics{
+			SourceAPackets: stats.SourceAPackets,
+			SourceAGapFill: stats.SourceAUsed,
+			SourceBPackets: stats.SourceBPackets,
+			SourceBGapFill: stats.SourceBUsed,
+			OutputPackets:  stats.OutputPackets,
+			MissingPackets: stats.MissingPackets,
+		}
 	}
 
 	return m
 }
 
-// ListRunning returns IDs of all running flows
 func (e *Engine) ListRunning() []string {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -206,7 +275,6 @@ func (e *Engine) ListRunning() []string {
 	return ids
 }
 
-// StopAll stops all running flows
 func (e *Engine) StopAll() {
 	e.mu.Lock()
 	ids := make([]string, 0, len(e.sessions))
@@ -222,11 +290,11 @@ func (e *Engine) StopAll() {
 	}
 }
 
-// runSession is the main loop for a flow session.
-// It runs FFmpeg, monitors health, and handles failover.
-func (e *Engine) runSession(sess *Session) {
+// ===== MERGE MODE =====
+// Runs both sources through RTPMerger, feeds merged stream to FFmpeg
+
+func (e *Engine) runMergeSession(sess *Session) {
 	defer func() {
-		// Remove session from map on exit (idempotent with StopFlow's delete)
 		e.mu.Lock()
 		delete(e.sessions, sess.FlowID)
 		e.mu.Unlock()
@@ -234,8 +302,102 @@ func (e *Engine) runSession(sess *Session) {
 	}()
 	flowID := sess.FlowID
 
+	sources := e.allSources(sess.Flow)
+	if len(sources) < 2 {
+		e.emit(flowID, "error", "MERGE mode requires 2 sources", "error")
+		return
+	}
+
+	srcA := sources[0]
+	srcB := sources[1]
+
+	// Allocate a local port for merged output
+	e.mu.Lock()
+	mergePort := e.allocMergePort()
+	e.mu.Unlock()
+
+	recoveryMs := 100
+	if sess.Flow.SourceFailoverConfig != nil && sess.Flow.SourceFailoverConfig.RecoveryWindow > 0 {
+		recoveryMs = sess.Flow.SourceFailoverConfig.RecoveryWindow
+	}
+
+	merger := merge.NewRTPMerger(srcA.IngestPort, srcB.IngestPort, mergePort, recoveryMs)
+	if err := merger.Start(); err != nil {
+		e.emit(flowID, "error", fmt.Sprintf("Failed to start merger: %v", err), "error")
+		return
+	}
+
+	sess.mu.Lock()
+	sess.Merger = merger
+	sess.ActiveSource = "merged(" + srcA.Name + "+" + srcB.Name + ")"
+	sess.mu.Unlock()
+
+	defer merger.Stop()
+
+	e.emit(flowID, "merge_started", fmt.Sprintf("MERGE mode: %s (port %d) + %s (port %d) -> merged (port %d, recovery=%dms)",
+		srcA.Name, srcA.IngestPort, srcB.Name, srcB.IngestPort, mergePort, recoveryMs), "info")
+
+	// Create a synthetic source that reads from the merged local port
+	mergedSource := &types.Source{
+		Name:       "merged",
+		Protocol:   types.ProtocolUDP, // merged output is raw UDP
+		IngestPort: mergePort,
+	}
+
+	// Run FFmpeg reading from merged stream
 	for {
-		// Pick current active source
+		err := e.runFFmpeg(sess, mergedSource)
+		if sess.Ctx.Err() != nil {
+			e.emit(flowID, "flow_stopped", "Merge flow transport stopped", "info")
+			return
+		}
+
+		if err != nil {
+			e.emit(flowID, "merge_error", fmt.Sprintf("Merged stream error: %v", err), "warning")
+		} else {
+			e.emit(flowID, "merge_eof", "Merged stream ended", "warning")
+		}
+
+		// Update merge stats into source health
+		stats := merger.Stats()
+		sess.mu.Lock()
+		if h, ok := sess.SourceHealth[srcA.Name]; ok {
+			h.PacketsReceived = stats.SourceAPackets
+			h.Connected = stats.SourceAPackets > 0
+		}
+		if h, ok := sess.SourceHealth[srcB.Name]; ok {
+			h.PacketsReceived = stats.SourceBPackets
+			h.Connected = stats.SourceBPackets > 0
+		}
+		sess.mu.Unlock()
+
+		select {
+		case <-time.After(2 * time.Second):
+		case <-sess.Ctx.Done():
+			return
+		}
+	}
+}
+
+// ===== FAILOVER MODE =====
+// Standard failover with auto-recovery to primary
+
+func (e *Engine) runFailoverSession(sess *Session) {
+	defer func() {
+		e.mu.Lock()
+		delete(e.sessions, sess.FlowID)
+		e.mu.Unlock()
+		close(sess.Done)
+	}()
+	flowID := sess.FlowID
+
+	// Start auto-recovery probe if configured with a primary source
+	primaryName := e.getPrimarySourceName(sess.Flow)
+	if primaryName != "" {
+		go e.probeForPrimaryRecovery(sess, primaryName)
+	}
+
+	for {
 		source := e.findSource(sess.Flow, sess.ActiveSource)
 		if source == nil {
 			e.emit(flowID, "error", "active source not found: "+sess.ActiveSource, "error")
@@ -244,16 +406,13 @@ func (e *Engine) runSession(sess *Session) {
 
 		e.emit(flowID, "source_active", fmt.Sprintf("Using source: %s (%s on port %d)", source.Name, source.Protocol, source.IngestPort), "info")
 
-		// Build and run FFmpeg
 		err := e.runFFmpeg(sess, source)
 
-		// Check if we were cancelled (intentional stop)
 		if sess.Ctx.Err() != nil {
 			e.emit(flowID, "flow_stopped", "Flow transport stopped", "info")
 			return
 		}
 
-		// FFmpeg exited unexpectedly - try failover
 		if err != nil {
 			e.emit(flowID, "source_error", fmt.Sprintf("Source %s failed: %v", source.Name, err), "warning")
 
@@ -264,7 +423,6 @@ func (e *Engine) runSession(sess *Session) {
 			}
 			sess.mu.Unlock()
 
-			// Attempt failover if configured
 			if e.shouldFailover(sess.Flow) {
 				backup := e.getBackupSource(sess.Flow, source.Name)
 				if backup != nil {
@@ -277,7 +435,6 @@ func (e *Engine) runSession(sess *Session) {
 						fmt.Sprintf("Failover: %s -> %s (count: %d)", source.Name, backup.Name, sess.FailoverCount),
 						"warning")
 
-					// Brief pause before retry with new source
 					select {
 					case <-time.After(200 * time.Millisecond):
 					case <-sess.Ctx.Done():
@@ -287,7 +444,6 @@ func (e *Engine) runSession(sess *Session) {
 				}
 			}
 
-			// No failover available - retry same source after delay
 			e.emit(flowID, "source_retry", fmt.Sprintf("Retrying source %s in 2s...", source.Name), "warning")
 			select {
 			case <-time.After(2 * time.Second):
@@ -297,8 +453,7 @@ func (e *Engine) runSession(sess *Session) {
 			continue
 		}
 
-		// Clean exit - for live streams this means the source stopped
-		// (e.g. UDP timeout with no more data). Treat as a failover trigger.
+		// Clean exit - treat as failover trigger
 		e.emit(flowID, "source_eof", fmt.Sprintf("Source %s ended (no more data)", source.Name), "warning")
 
 		sess.mu.Lock()
@@ -307,7 +462,6 @@ func (e *Engine) runSession(sess *Session) {
 		}
 		sess.mu.Unlock()
 
-		// Attempt failover if configured
 		if e.shouldFailover(sess.Flow) {
 			backup := e.getBackupSource(sess.Flow, source.Name)
 			if backup != nil {
@@ -329,19 +483,79 @@ func (e *Engine) runSession(sess *Session) {
 			}
 		}
 
-		// No failover - retry same source after delay
 		e.emit(flowID, "source_retry", fmt.Sprintf("Retrying source %s in 2s...", source.Name), "warning")
 		select {
 		case <-time.After(2 * time.Second):
 		case <-sess.Ctx.Done():
 			return
 		}
-		continue
 	}
 }
 
-// runFFmpeg builds and runs the FFmpeg command for a given source -> outputs.
-// Uses SIGTERM for graceful shutdown instead of SIGKILL (exec.CommandContext default).
+// probeForPrimaryRecovery runs in a goroutine during FAILOVER mode.
+// When running on backup, it probes the primary source port and switches back when data arrives.
+func (e *Engine) probeForPrimaryRecovery(sess *Session, primaryName string) {
+	primarySource := e.findSource(sess.Flow, primaryName)
+	if primarySource == nil {
+		return
+	}
+
+	for {
+		select {
+		case <-sess.Ctx.Done():
+			return
+		case <-time.After(3 * time.Second): // probe every 3 seconds
+		}
+
+		sess.mu.RLock()
+		currentActive := sess.ActiveSource
+		sess.mu.RUnlock()
+
+		// Only probe when we're NOT on the primary
+		if currentActive == primaryName {
+			continue
+		}
+
+		// Try to detect data on the primary source
+		if e.probeSourceAlive(primarySource, 2*time.Second) {
+			e.emit(sess.FlowID, "primary_recovered",
+				fmt.Sprintf("Primary source %s recovered, switching back", primaryName), "info")
+
+			sess.mu.Lock()
+			sess.ActiveSource = primaryName
+			sess.FailoverCount++
+			sess.mu.Unlock()
+
+			// The main loop will pick up the new ActiveSource on its next iteration
+			// We need to interrupt the current FFmpeg to trigger the switch
+			sess.mu.RLock()
+			cmd := sess.Cmd
+			sess.mu.RUnlock()
+			if cmd != nil && cmd.Process != nil {
+				cmd.Process.Signal(syscall.SIGTERM)
+			}
+		}
+	}
+}
+
+// probeSourceAlive checks if a source is delivering data by running a quick ffprobe
+func (e *Engine) probeSourceAlive(source *types.Source, timeout time.Duration) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	uri := source.BuildSourceURI()
+	cmd := exec.CommandContext(ctx, e.ffprobePath,
+		"-v", "quiet",
+		"-analyzeduration", "500000", // 500ms
+		"-probesize", "32768",
+		"-i", uri,
+	)
+	err := cmd.Run()
+	return err == nil
+}
+
+// ===== FFmpeg Execution =====
+
 func (e *Engine) runFFmpeg(sess *Session, source *types.Source) error {
 	args := e.buildArgs(source, sess.Flow.Outputs)
 	log.Printf("[flow:%s] ffmpeg %s", sess.FlowID, strings.Join(args, " "))
@@ -360,15 +574,12 @@ func (e *Engine) runFFmpeg(sess *Session, source *types.Source) error {
 		return fmt.Errorf("start ffmpeg: %w", err)
 	}
 
-	// Watch for context cancellation and send SIGTERM (not SIGKILL)
-	// so FFmpeg can flush buffers and close connections cleanly
 	waitDone := make(chan struct{})
 	go func() {
 		select {
 		case <-sess.Ctx.Done():
 			if cmd.Process != nil {
 				cmd.Process.Signal(syscall.SIGTERM)
-				// Give FFmpeg up to 5s to exit gracefully, then force kill
 				select {
 				case <-waitDone:
 				case <-time.After(5 * time.Second):
@@ -376,23 +587,20 @@ func (e *Engine) runFFmpeg(sess *Session, source *types.Source) error {
 				}
 			}
 		case <-waitDone:
-			// Process exited on its own
 		}
 	}()
 
-	// Monitor stderr for health - Connected will be set when we see actual data
 	e.monitorStderr(sess, source.Name, stderr)
 
 	err = cmd.Wait()
 	close(waitDone)
 
 	if sess.Ctx.Err() != nil {
-		return nil // intentional cancellation
+		return nil
 	}
 	return err
 }
 
-// buildArgs constructs FFmpeg arguments for live transport (passthrough)
 func (e *Engine) buildArgs(source *types.Source, outputs []*types.Output) []string {
 	args := []string{
 		"-hide_banner",
@@ -400,10 +608,8 @@ func (e *Engine) buildArgs(source *types.Source, outputs []*types.Output) []stri
 		"-stats",
 	}
 
-	// Source input args
 	args = append(args, e.sourceInputArgs(source)...)
 
-	// Count enabled outputs
 	enabledOutputs := make([]*types.Output, 0)
 	for _, out := range outputs {
 		if out.Status != types.OutputDisabled {
@@ -411,14 +617,11 @@ func (e *Engine) buildArgs(source *types.Source, outputs []*types.Output) []stri
 		}
 	}
 
-	// Guard: no enabled outputs - send to null
 	if len(enabledOutputs) == 0 {
 		args = append(args, "-c", "copy", "-f", "null", "-")
 		return args
 	}
 
-	// Each output gets its own -c copy -f <format> <uri>
-	// This avoids tee muxer compatibility issues with stream copy
 	for _, out := range enabledOutputs {
 		args = append(args, "-c", "copy")
 		args = append(args, e.outputArgs(out)...)
@@ -433,20 +636,16 @@ func (e *Engine) sourceInputArgs(source *types.Source) []string {
 
 	switch source.Protocol {
 	case types.ProtocolSRTListener, types.ProtocolSRTCaller:
-		// SRT params (latency, maxbw) are in the URI
-		// Input format for SRT is mpegts
 		args = append(args, "-f", "mpegts")
 	case types.ProtocolRTP, types.ProtocolRTPFEC:
 		args = append(args, "-protocol_whitelist", "file,rtp,udp")
 	case types.ProtocolUDP:
-		// UDP: set reasonable buffer and timeout
 		args = append(args, "-buffer_size", "65536")
-		args = append(args, "-timeout", "5000000") // 5s timeout in microseconds
+		args = append(args, "-timeout", "5000000")
 	case types.ProtocolRIST:
-		// RIST: input format is mpegts
 		args = append(args, "-f", "mpegts")
 	case types.ProtocolRTMP:
-		// RTMP listen mode - librtmp auto-detects FLV format
+		args = append(args, "-live_start_index", "-1")
 	}
 
 	args = append(args, "-i", source.BuildSourceURI())
@@ -470,24 +669,26 @@ func (e *Engine) outputArgs(out *types.Output) []string {
 	return args
 }
 
-// Regex to detect FFmpeg progress lines like "frame= 123 fps= 25 ..."
-var progressRe = regexp.MustCompile(`frame=\s*\d+`)
+// ===== Monitoring =====
 
-// monitorStderr reads FFmpeg stderr to detect connection health
+var progressRe = regexp.MustCompile(`frame=\s*\d+`)
+var dropRe = regexp.MustCompile(`drop=\s*(\d+)`)
+var dupRe = regexp.MustCompile(`dup=\s*(\d+)`)
+var speedRe = regexp.MustCompile(`speed=\s*([\d.]+)x`)
+
 func (e *Engine) monitorStderr(sess *Session, sourceName string, r io.Reader) {
 	scanner := bufio.NewScanner(r)
-	scanner.Buffer(make([]byte, 256*1024), 256*1024) // 256KB max line
+	scanner.Buffer(make([]byte, 256*1024), 256*1024)
 	for scanner.Scan() {
 		line := scanner.Text()
 		log.Printf("[flow:%s] ffmpeg: %s", sess.FlowID, line)
 
-		// Detect actual data flow from progress stats
 		if progressRe.MatchString(line) {
 			sess.mu.Lock()
 			if h, ok := sess.SourceHealth[sourceName]; ok {
 				h.Connected = true
 				h.LastDataTime = time.Now()
-				// Parse bitrate if available (e.g. "bitrate= 1234.5kbits/s")
+
 				if idx := strings.Index(line, "bitrate="); idx >= 0 {
 					br := strings.TrimSpace(line[idx+8:])
 					if end := strings.IndexAny(br, " \t"); end > 0 {
@@ -499,21 +700,61 @@ func (e *Engine) monitorStderr(sess *Session, sourceName string, r io.Reader) {
 						h.BitrateKbps = int64(v)
 					}
 				}
+
+				// Parse drop count
+				if m := dropRe.FindStringSubmatch(line); len(m) > 1 {
+					if v, err := strconv.ParseInt(m[1], 10, 64); err == nil {
+						h.PacketsLost = v
+					}
+				}
+			}
+
+			// Mark all enabled outputs as connected when we see data flowing
+			for _, out := range sess.Flow.Outputs {
+				if out.Status != types.OutputDisabled {
+					if oh, ok := sess.OutputHealth[out.Name]; ok {
+						oh.Connected = true
+					}
+				}
 			}
 			sess.mu.Unlock()
 		}
 
-		// Detect connection issues
 		lower := strings.ToLower(line)
 		if strings.Contains(lower, "connection refused") ||
 			strings.Contains(lower, "connection timed out") ||
 			strings.Contains(lower, "no route to host") {
 			e.emit(sess.FlowID, "connection_error", line, "error")
 		}
+
+		// Detect SRT-specific stats
+		if strings.Contains(lower, "rtt=") {
+			if idx := strings.Index(lower, "rtt="); idx >= 0 {
+				rttStr := lower[idx+4:]
+				if end := strings.IndexAny(rttStr, " \t,"); end > 0 {
+					rttStr = rttStr[:end]
+				}
+				sess.mu.Lock()
+				if h, ok := sess.SourceHealth[sourceName]; ok {
+					if v, err := strconv.ParseFloat(rttStr, 64); err == nil {
+						h.RoundTripTimeMs = int64(v)
+					}
+				}
+				sess.mu.Unlock()
+			}
+		}
 	}
 }
 
-// Failover helpers
+// ===== Helpers =====
+
+func (e *Engine) isMergeMode(flow *types.Flow) bool {
+	if flow.SourceFailoverConfig == nil {
+		return false
+	}
+	return flow.SourceFailoverConfig.State == types.FailoverEnabled &&
+		flow.SourceFailoverConfig.FailoverMode == types.FailoverModeMerge
+}
 
 func (e *Engine) shouldFailover(flow *types.Flow) bool {
 	if flow.SourceFailoverConfig == nil {
@@ -522,8 +763,15 @@ func (e *Engine) shouldFailover(flow *types.Flow) bool {
 	return flow.SourceFailoverConfig.State == types.FailoverEnabled && len(e.allSources(flow)) > 1
 }
 
+func (e *Engine) getPrimarySourceName(flow *types.Flow) string {
+	if flow.SourceFailoverConfig != nil &&
+		flow.SourceFailoverConfig.SourcePriority != nil {
+		return flow.SourceFailoverConfig.SourcePriority.PrimarySource
+	}
+	return ""
+}
+
 func (e *Engine) pickActiveSource(flow *types.Flow) *types.Source {
-	// If failover is configured with a primary, use it
 	if flow.SourceFailoverConfig != nil &&
 		flow.SourceFailoverConfig.SourcePriority != nil &&
 		flow.SourceFailoverConfig.SourcePriority.PrimarySource != "" {
@@ -533,7 +781,6 @@ func (e *Engine) pickActiveSource(flow *types.Flow) *types.Source {
 			}
 		}
 	}
-	// Default to first source
 	if flow.Source != nil {
 		return flow.Source
 	}

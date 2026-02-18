@@ -8,10 +8,12 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
+	"github.com/openclaw/mroute/internal/monitor"
 	"github.com/openclaw/mroute/internal/transport"
 	"github.com/openclaw/mroute/pkg/types"
 )
@@ -20,11 +22,13 @@ import (
 type Manager struct {
 	db      *sql.DB
 	engine  *transport.Engine
+	monitor *monitor.Monitor // optional: thumbnails, metadata, content quality
 	onEvent func(flowID, eventType, message, severity string)
 	eventMu sync.RWMutex // protects onEvent callback
+	stopMW  chan struct{} // stops maintenance window scheduler
 }
 
-func NewManager(dsn string, engine *transport.Engine) (*Manager, error) {
+func NewManager(dsn string, engine *transport.Engine, mon *monitor.Monitor) (*Manager, error) {
 	var dbPath string
 	if len(dsn) > 7 && dsn[:7] == "sqlite:" {
 		dbPath = dsn[7:]
@@ -41,22 +45,28 @@ func NewManager(dsn string, engine *transport.Engine) (*Manager, error) {
 	db.SetMaxIdleConns(2)
 
 	if err := db.Ping(); err != nil {
+		db.Close()
 		return nil, fmt.Errorf("ping db: %w", err)
 	}
 
-	m := &Manager{db: db, engine: engine}
+	m := &Manager{db: db, engine: engine, monitor: mon, stopMW: make(chan struct{})}
 	if err := m.initSchema(); err != nil {
+		db.Close()
 		return nil, fmt.Errorf("schema: %w", err)
 	}
 
 	// Wire engine events to flow manager
 	engine.SetEventCallback(m.handleEngineEvent)
 
+	// Start maintenance window scheduler
+	go m.maintenanceScheduler()
+
 	log.Println("Flow manager initialized")
 	return m, nil
 }
 
 func (m *Manager) Close() error {
+	close(m.stopMW)
 	return m.db.Close()
 }
 
@@ -122,6 +132,10 @@ func (m *Manager) CreateFlow(flow *types.Flow) error {
 			return err
 		}
 	}
+	// Validate failover config
+	if err := types.ValidateFailoverConfig(flow.SourceFailoverConfig, m.allSources(flow)); err != nil {
+		return err
+	}
 
 	flow.Status = types.FlowStandby
 	flow.CreatedAt = time.Now()
@@ -173,9 +187,12 @@ func (m *Manager) GetFlow(id string) (*types.Flow, error) {
 		flow.StoppedAt = &t
 	}
 
-	// Overlay live status if running
+	// Overlay live status from engine
 	if m.engine.IsRunning(id) {
 		flow.Status = types.FlowActive
+	} else if flow.Status == types.FlowActive || flow.Status == types.FlowStarting {
+		// Engine session ended but DB still marked active - correct it
+		flow.Status = types.FlowError
 	}
 
 	return &flow, nil
@@ -239,6 +256,9 @@ func (m *Manager) FlowCounts() (total int, active int, err error) {
 // DeleteFlow removes a flow (stops it first if running)
 func (m *Manager) DeleteFlow(id string) error {
 	// Always try to stop - avoids TOCTOU race where flow starts between check and delete
+	if m.monitor != nil {
+		m.monitor.StopMonitoring(id)
+	}
 	_ = m.engine.StopFlow(id)
 	// Delete flow and its events atomically
 	tx, err := m.db.Begin()
@@ -286,6 +306,14 @@ func (m *Manager) StartFlow(id string) error {
 		return err
 	}
 
+	// Start source monitoring (thumbnails, metadata, content quality)
+	if m.monitor != nil {
+		src := m.primarySource(flow)
+		if src != nil {
+			m.monitor.StartMonitoring(id, src.BuildSourceURI(), flow.SourceMonitorConfig)
+		}
+	}
+
 	flow.Status = types.FlowActive
 	if err := m.saveFlow(flow); err != nil {
 		log.Printf("warning: failed to save active state for flow %s: %v", id, err)
@@ -305,6 +333,10 @@ func (m *Manager) StopFlow(id string) error {
 	// Don't stop if already stopped
 	if flow.Status == types.FlowStandby && !m.engine.IsRunning(id) {
 		return nil
+	}
+
+	if m.monitor != nil {
+		m.monitor.StopMonitoring(id)
 	}
 
 	if err := m.engine.StopFlow(id); err != nil {
@@ -569,4 +601,100 @@ func (m *Manager) allSources(flow *types.Flow) []*types.Source {
 	}
 	sources = append(sources, flow.Sources...)
 	return sources
+}
+
+func (m *Manager) primarySource(flow *types.Flow) *types.Source {
+	if flow.Source != nil {
+		return flow.Source
+	}
+	if len(flow.Sources) > 0 {
+		return flow.Sources[0]
+	}
+	return nil
+}
+
+// GetThumbnail returns the latest thumbnail for a running flow
+func (m *Manager) GetThumbnail(flowID string) *types.Thumbnail {
+	if m.monitor == nil {
+		return nil
+	}
+	return m.monitor.GetThumbnail(flowID)
+}
+
+// GetSourceMetadata returns ffprobe metadata for a running flow
+func (m *Manager) GetSourceMetadata(flowID string) *types.SourceMetadata {
+	if m.monitor == nil {
+		return nil
+	}
+	return m.monitor.GetMetadata(flowID)
+}
+
+// GetContentQuality returns content quality status for a running flow
+func (m *Manager) GetContentQuality(flowID string) *types.ContentQuality {
+	if m.monitor == nil {
+		return nil
+	}
+	return m.monitor.GetContentQuality(flowID)
+}
+
+// maintenanceScheduler runs in the background and restarts flows during
+// their configured maintenance windows if they've been running for 24+ hours.
+func (m *Manager) maintenanceScheduler() {
+	ticker := time.NewTicker(1 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-m.stopMW:
+			return
+		case <-ticker.C:
+			m.checkMaintenanceWindows()
+		}
+	}
+}
+
+func (m *Manager) checkMaintenanceWindows() {
+	running := m.engine.ListRunning()
+	now := time.Now().UTC()
+
+	for _, id := range running {
+		flow, err := m.GetFlow(id)
+		if err != nil || flow.MaintenanceWindow == nil {
+			continue
+		}
+
+		mw := flow.MaintenanceWindow
+		// Check day of week
+		if !strings.EqualFold(now.Weekday().String(), mw.DayOfWeek) {
+			continue
+		}
+		// Check hour
+		if now.Hour() != mw.StartHour {
+			continue
+		}
+		// Only restart if running for 24+ hours
+		if flow.StartedAt == nil || time.Since(*flow.StartedAt) < 24*time.Hour {
+			continue
+		}
+		// Only restart once per window (check minute)
+		if now.Minute() > 1 {
+			continue
+		}
+
+		log.Printf("[maintenance] Restarting flow %s (%s) for maintenance", id, flow.Name)
+		m.recordEvent(id, "maintenance_restart", fmt.Sprintf("Maintenance window restart (%s %02d:00 UTC)", mw.DayOfWeek, mw.StartHour), "info")
+
+		if err := m.StopFlow(id); err != nil {
+			log.Printf("[maintenance] Stop flow %s error: %v", id, err)
+			continue
+		}
+		select {
+		case <-time.After(2 * time.Second):
+		case <-m.stopMW:
+			return
+		}
+		if err := m.StartFlow(id); err != nil {
+			log.Printf("[maintenance] Restart flow %s error: %v", id, err)
+		}
+	}
 }

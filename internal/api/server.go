@@ -117,6 +117,12 @@ func (s *Server) handleFlowDetail(w http.ResponseWriter, r *http.Request) {
 		s.flowMetrics(w, r, id)
 	case "events":
 		s.flowEvents(w, r, id)
+	case "thumbnail":
+		s.flowThumbnail(w, r, id)
+	case "metadata":
+		s.flowSourceMetadata(w, r, id)
+	case "content-quality":
+		s.flowContentQuality(w, r, id)
 	default:
 		writeErr(w, 404, "unknown action: "+action)
 	}
@@ -283,6 +289,45 @@ func (s *Server) flowEvents(w http.ResponseWriter, r *http.Request, id string) {
 		return
 	}
 	writeJSON(w, 200, map[string]interface{}{"events": events})
+}
+
+func (s *Server) flowThumbnail(w http.ResponseWriter, r *http.Request, id string) {
+	if r.Method != http.MethodGet {
+		writeErr(w, 405, "use GET")
+		return
+	}
+	thumb := s.mgr.GetThumbnail(id)
+	if thumb == nil {
+		writeErr(w, 404, "no thumbnail available (flow not active or thumbnails not enabled)")
+		return
+	}
+	writeJSON(w, 200, thumb)
+}
+
+func (s *Server) flowSourceMetadata(w http.ResponseWriter, r *http.Request, id string) {
+	if r.Method != http.MethodGet {
+		writeErr(w, 405, "use GET")
+		return
+	}
+	meta := s.mgr.GetSourceMetadata(id)
+	if meta == nil {
+		writeErr(w, 404, "no metadata available (flow not active or probe pending)")
+		return
+	}
+	writeJSON(w, 200, meta)
+}
+
+func (s *Server) flowContentQuality(w http.ResponseWriter, r *http.Request, id string) {
+	if r.Method != http.MethodGet {
+		writeErr(w, 405, "use GET")
+		return
+	}
+	quality := s.mgr.GetContentQuality(id)
+	if quality == nil {
+		writeErr(w, 404, "no content quality data (flow not active or quality monitoring not enabled)")
+		return
+	}
+	writeJSON(w, 200, quality)
 }
 
 // --- Events (global) ---
