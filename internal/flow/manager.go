@@ -250,8 +250,13 @@ func (m *Manager) DeleteFlow(id string) error {
 	if _, err := tx.Exec("DELETE FROM events WHERE flow_id = ?", id); err != nil {
 		return fmt.Errorf("delete events: %w", err)
 	}
-	if _, err := tx.Exec("DELETE FROM flows WHERE id = ?", id); err != nil {
+	res, err := tx.Exec("DELETE FROM flows WHERE id = ?", id)
+	if err != nil {
 		return fmt.Errorf("delete flow: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("flow not found: %s", id)
 	}
 	return tx.Commit()
 }
@@ -448,15 +453,9 @@ func (m *Manager) UpdateOutput(flowID, outputName string, updates *types.Output)
 				o.Destination = updates.Destination
 			}
 			if updates.Port != 0 {
-				if updates.Port < 1 || updates.Port > 65535 {
-					return fmt.Errorf("invalid port %d", updates.Port)
-				}
 				o.Port = updates.Port
 			}
 			if updates.Protocol != "" {
-				if !types.IsValidProtocol(updates.Protocol) {
-					return fmt.Errorf("unsupported protocol: %s", updates.Protocol)
-				}
 				o.Protocol = updates.Protocol
 			}
 			if updates.Status != "" {
@@ -467,6 +466,10 @@ func (m *Manager) UpdateOutput(flowID, outputName string, updates *types.Output)
 			}
 			if updates.StreamKey != "" {
 				o.StreamKey = updates.StreamKey
+			}
+			// Validate the composite output after all partial updates
+			if err := types.ValidateOutput(o); err != nil {
+				return err
 			}
 			flow.UpdatedAt = time.Now()
 			return m.saveFlow(flow)

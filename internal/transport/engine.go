@@ -107,11 +107,11 @@ func (e *Engine) StartFlow(flow *types.Flow) error {
 	}
 
 	// Init health tracking for all sources
-	for _, src := range e.allSources(flow) {
+	for _, src := range e.allSources(flowCopy) {
 		sess.SourceHealth[src.Name] = &SourceHealth{Name: src.Name}
 	}
 
-	e.sessions[flow.ID] = sess
+	e.sessions[flowCopy.ID] = sess
 	e.mu.Unlock()
 
 	go e.runSession(sess)
@@ -225,7 +225,13 @@ func (e *Engine) StopAll() {
 // runSession is the main loop for a flow session.
 // It runs FFmpeg, monitors health, and handles failover.
 func (e *Engine) runSession(sess *Session) {
-	defer close(sess.Done)
+	defer func() {
+		// Remove session from map on exit (idempotent with StopFlow's delete)
+		e.mu.Lock()
+		delete(e.sessions, sess.FlowID)
+		e.mu.Unlock()
+		close(sess.Done)
+	}()
 	flowID := sess.FlowID
 
 	for {
