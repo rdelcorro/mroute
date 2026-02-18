@@ -1,0 +1,7 @@
+mroute
+*.db
+*.db-shm
+*.db-wal
+server.log
+server.pid
+*.mp4
