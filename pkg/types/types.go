@@ -2,8 +2,10 @@ package types
 
 import (
 	"fmt"
+	"net"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -197,6 +199,9 @@ func ValidateSource(s *Source) error {
 		if s.SenderIPAddress == "" {
 			return fmt.Errorf("source %s: sender_ip_address required for srt-caller", s.Name)
 		}
+		if net.ParseIP(s.SenderIPAddress) == nil {
+			return fmt.Errorf("source %s: invalid sender_ip_address (must be valid IP)", s.Name)
+		}
 		if s.SenderControlPort < 1 || s.SenderControlPort > 65535 {
 			return fmt.Errorf("source %s: invalid sender_control_port %d (must be 1-65535)", s.Name, s.SenderControlPort)
 		}
@@ -205,6 +210,10 @@ func ValidateSource(s *Source) error {
 		if s.IngestPort < 1 || s.IngestPort > 65535 {
 			return fmt.Errorf("source %s: invalid ingest_port %d (must be 1-65535)", s.Name, s.IngestPort)
 		}
+	}
+	// Validate StreamID (used in RTMP/SRT URIs - must not contain whitespace or URI-breaking chars)
+	if s.StreamID != "" && strings.ContainsAny(s.StreamID, " \t\n\r?&#") {
+		return fmt.Errorf("source %s: stream_id must not contain whitespace or special URI characters", s.Name)
 	}
 	return nil
 }
@@ -220,9 +229,33 @@ func ValidateOutput(o *Output) error {
 	if o.Port < 1 || o.Port > 65535 {
 		return fmt.Errorf("output %s: invalid port %d (must be 1-65535)", o.Name, o.Port)
 	}
-	// Non-listener outputs need a destination
-	if o.Protocol != ProtocolSRTListener && o.Destination == "" {
-		return fmt.Errorf("output %s: destination required for protocol %s", o.Name, o.Protocol)
+	// Non-listener outputs need a valid destination (IP or hostname)
+	if o.Protocol != ProtocolSRTListener {
+		if o.Destination == "" {
+			return fmt.Errorf("output %s: destination required for protocol %s", o.Name, o.Protocol)
+		}
+		if err := validateHost(o.Destination); err != nil {
+			return fmt.Errorf("output %s: invalid destination: %w", o.Name, err)
+		}
+	}
+	// Validate StreamKey (used in RTMP URIs - must not contain whitespace or URI-breaking chars)
+	if o.StreamKey != "" && strings.ContainsAny(o.StreamKey, " \t\n\r?&#/") {
+		return fmt.Errorf("output %s: stream_key must not contain whitespace or special URI characters", o.Name)
+	}
+	return nil
+}
+
+// validateHost checks that a string is a valid IP address or hostname
+func validateHost(h string) error {
+	if net.ParseIP(h) != nil {
+		return nil
+	}
+	// Check for URI-breaking characters (basic hostname validation)
+	if strings.ContainsAny(h, " \t\n\r/?#:@") {
+		return fmt.Errorf("contains invalid characters")
+	}
+	if h == "" || len(h) > 253 {
+		return fmt.Errorf("empty or too long")
 	}
 	return nil
 }
@@ -300,6 +333,50 @@ func (o *Output) BuildOutputURI() string {
 	default:
 		return ""
 	}
+}
+
+// DeepCopy returns a deep copy of the Flow to avoid data races
+func (f *Flow) DeepCopy() *Flow {
+	cp := *f
+	if f.Source != nil {
+		s := *f.Source
+		cp.Source = &s
+	}
+	if len(f.Sources) > 0 {
+		cp.Sources = make([]*Source, len(f.Sources))
+		for i, s := range f.Sources {
+			sCopy := *s
+			cp.Sources[i] = &sCopy
+		}
+	}
+	if len(f.Outputs) > 0 {
+		cp.Outputs = make([]*Output, len(f.Outputs))
+		for i, o := range f.Outputs {
+			oCopy := *o
+			if len(o.CidrAllowList) > 0 {
+				oCopy.CidrAllowList = make([]string, len(o.CidrAllowList))
+				copy(oCopy.CidrAllowList, o.CidrAllowList)
+			}
+			cp.Outputs[i] = &oCopy
+		}
+	}
+	if f.SourceFailoverConfig != nil {
+		fc := *f.SourceFailoverConfig
+		if f.SourceFailoverConfig.SourcePriority != nil {
+			sp := *f.SourceFailoverConfig.SourcePriority
+			fc.SourcePriority = &sp
+		}
+		cp.SourceFailoverConfig = &fc
+	}
+	if f.StartedAt != nil {
+		t := *f.StartedAt
+		cp.StartedAt = &t
+	}
+	if f.StoppedAt != nil {
+		t := *f.StoppedAt
+		cp.StoppedAt = &t
+	}
+	return &cp
 }
 
 func listenAddr(port int) string {

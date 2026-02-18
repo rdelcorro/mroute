@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"sync"
@@ -150,8 +151,11 @@ func (m *Manager) GetFlow(id string) (*types.Flow, error) {
 
 	err := m.db.QueryRow("SELECT data, created_at, updated_at, started_at, stopped_at FROM flows WHERE id = ?", id).
 		Scan(&data, &createdAt, &updatedAt, &startedAt, &stoppedAt)
-	if err != nil {
+	if errors.Is(err, sql.ErrNoRows) {
 		return nil, fmt.Errorf("flow not found: %s", id)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("database error fetching flow %s: %w", id, err)
 	}
 
 	var flow types.Flow
@@ -234,9 +238,8 @@ func (m *Manager) FlowCounts() (total int, active int, err error) {
 
 // DeleteFlow removes a flow (stops it first if running)
 func (m *Manager) DeleteFlow(id string) error {
-	if m.engine.IsRunning(id) {
-		m.engine.StopFlow(id)
-	}
+	// Always try to stop - avoids TOCTOU race where flow starts between check and delete
+	_ = m.engine.StopFlow(id)
 	// Delete flow and its events atomically
 	tx, err := m.db.Begin()
 	if err != nil {
@@ -542,6 +545,8 @@ func (m *Manager) recordEvent(flowID, eventType, message, severity string) {
 		id, flowID, eventType, message, severity, time.Now().Format(time.RFC3339)); err != nil {
 		log.Printf("record event error: %v", err)
 	}
+	// Prune old events per flow (keep last 1000)
+	m.db.Exec("DELETE FROM events WHERE flow_id = ? AND id NOT IN (SELECT id FROM events WHERE flow_id = ? ORDER BY timestamp DESC LIMIT 1000)", flowID, flowID)
 }
 
 func (m *Manager) handleEngineEvent(flowID, eventType, message, severity string) {

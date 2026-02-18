@@ -151,7 +151,11 @@ func (s *Server) flowStart(w http.ResponseWriter, r *http.Request, id string) {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	f, _ := s.mgr.GetFlow(id)
+	f, err := s.mgr.GetFlow(id)
+	if err != nil {
+		writeJSON(w, 200, map[string]interface{}{"id": id, "message": "flow started"})
+		return
+	}
 	writeJSON(w, 200, map[string]interface{}{
 		"id":      id,
 		"status":  f.Status,
@@ -168,7 +172,11 @@ func (s *Server) flowStop(w http.ResponseWriter, r *http.Request, id string) {
 		writeErr(w, 400, err.Error())
 		return
 	}
-	f, _ := s.mgr.GetFlow(id)
+	f, err := s.mgr.GetFlow(id)
+	if err != nil {
+		writeJSON(w, 200, map[string]interface{}{"id": id, "message": "flow stopped"})
+		return
+	}
 	writeJSON(w, 200, map[string]interface{}{
 		"id":      id,
 		"status":  f.Status,
@@ -189,8 +197,7 @@ func (s *Server) flowSource(w http.ResponseWriter, r *http.Request, id, sourceNa
 			writeErr(w, 400, err.Error())
 			return
 		}
-		f, _ := s.mgr.GetFlow(id)
-		writeJSON(w, 200, f)
+		s.writeFlow(w, id)
 	case http.MethodDelete:
 		if sourceName == "" {
 			writeErr(w, 400, "source name required")
@@ -200,8 +207,7 @@ func (s *Server) flowSource(w http.ResponseWriter, r *http.Request, id, sourceNa
 			writeErr(w, 400, err.Error())
 			return
 		}
-		f, _ := s.mgr.GetFlow(id)
-		writeJSON(w, 200, f)
+		s.writeFlow(w, id)
 	default:
 		writeErr(w, 405, "use POST or DELETE")
 	}
@@ -220,8 +226,7 @@ func (s *Server) flowOutputs(w http.ResponseWriter, r *http.Request, id, outputN
 			writeErr(w, 400, err.Error())
 			return
 		}
-		f, _ := s.mgr.GetFlow(id)
-		writeJSON(w, 200, f)
+		s.writeFlow(w, id)
 	case http.MethodPut:
 		if outputName == "" {
 			writeErr(w, 400, "output name required")
@@ -237,8 +242,7 @@ func (s *Server) flowOutputs(w http.ResponseWriter, r *http.Request, id, outputN
 			writeErr(w, 400, err.Error())
 			return
 		}
-		f, _ := s.mgr.GetFlow(id)
-		writeJSON(w, 200, f)
+		s.writeFlow(w, id)
 	case http.MethodDelete:
 		if outputName == "" {
 			writeErr(w, 400, "output name required")
@@ -248,8 +252,7 @@ func (s *Server) flowOutputs(w http.ResponseWriter, r *http.Request, id, outputN
 			writeErr(w, 400, err.Error())
 			return
 		}
-		f, _ := s.mgr.GetFlow(id)
-		writeJSON(w, 200, f)
+		s.writeFlow(w, id)
 	default:
 		writeErr(w, 405, "use POST, PUT, or DELETE")
 	}
@@ -267,7 +270,7 @@ func (s *Server) flowMetrics(w http.ResponseWriter, r *http.Request, id string) 
 func (s *Server) flowEvents(w http.ResponseWriter, r *http.Request, id string) {
 	limit := 50
 	if l := r.URL.Query().Get("limit"); l != "" {
-		if n, err := strconv.Atoi(l); err == nil {
+		if n, err := strconv.Atoi(l); err == nil && n > 0 {
 			limit = n
 		}
 	}
@@ -285,9 +288,13 @@ func (s *Server) flowEvents(w http.ResponseWriter, r *http.Request, id string) {
 // --- Events (global) ---
 
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeErr(w, 405, "method not allowed")
+		return
+	}
 	limit := 100
 	if l := r.URL.Query().Get("limit"); l != "" {
-		if n, err := strconv.Atoi(l); err == nil {
+		if n, err := strconv.Atoi(l); err == nil && n > 0 {
 			limit = n
 		}
 	}
@@ -315,6 +322,15 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 		"total_flows":  total,
 		"active_flows": active,
 	})
+}
+
+func (s *Server) writeFlow(w http.ResponseWriter, id string) {
+	f, err := s.mgr.GetFlow(id)
+	if err != nil {
+		writeErr(w, 500, "failed to retrieve flow: "+err.Error())
+		return
+	}
+	writeJSON(w, 200, f)
 }
 
 func writeJSON(w http.ResponseWriter, code int, data interface{}) {

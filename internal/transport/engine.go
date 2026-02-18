@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/openclaw/mroute/pkg/types"
@@ -68,19 +69,23 @@ func (e *Engine) SetEventCallback(cb func(flowID, eventType, message, severity s
 	e.eventMu.Unlock()
 }
 
-// StartFlow starts live transport for a flow
+// StartFlow starts live transport for a flow.
+// The flow is deep-copied so the caller can safely mutate the original.
 func (e *Engine) StartFlow(flow *types.Flow) error {
+	// Deep-copy the flow to avoid data races with the caller
+	flowCopy := flow.DeepCopy()
+
 	// Determine initial source before locking
-	activeSource := e.pickActiveSource(flow)
+	activeSource := e.pickActiveSource(flowCopy)
 	if activeSource == nil {
-		return fmt.Errorf("no source configured for flow %s", flow.ID)
+		return fmt.Errorf("no source configured for flow %s", flowCopy.ID)
 	}
 
 	// Hold lock for entire check-and-insert to prevent TOCTOU race
 	e.mu.Lock()
-	if _, exists := e.sessions[flow.ID]; exists {
+	if _, exists := e.sessions[flowCopy.ID]; exists {
 		e.mu.Unlock()
-		return fmt.Errorf("flow %s is already running", flow.ID)
+		return fmt.Errorf("flow %s is already running", flowCopy.ID)
 	}
 
 	// Enforce MaxFlows limit
@@ -91,8 +96,8 @@ func (e *Engine) StartFlow(flow *types.Flow) error {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	sess := &Session{
-		FlowID:       flow.ID,
-		Flow:         flow,
+		FlowID:       flowCopy.ID,
+		Flow:         flowCopy,
 		ActiveSource: activeSource.Name,
 		Cancel:       cancel,
 		Ctx:          ctx,
@@ -134,16 +139,12 @@ func (e *Engine) StopFlow(flowID string) error {
 
 	sess.Cancel()
 
+	// runFFmpeg sends SIGTERM and waits 5s before SIGKILL,
+	// so we allow 15s total for graceful shutdown
 	select {
 	case <-sess.Done:
-	case <-time.After(10 * time.Second):
-		log.Printf("[flow:%s] stop timed out, force killing", flowID)
-		sess.mu.RLock()
-		cmd := sess.Cmd
-		sess.mu.RUnlock()
-		if cmd != nil && cmd.Process != nil {
-			cmd.Process.Kill()
-		}
+	case <-time.After(15 * time.Second):
+		log.Printf("[flow:%s] stop timed out", flowID)
 	}
 
 	e.mu.Lock()
@@ -215,7 +216,9 @@ func (e *Engine) StopAll() {
 	e.mu.Unlock()
 
 	for _, id := range ids {
-		e.StopFlow(id)
+		if err := e.StopFlow(id); err != nil {
+			log.Printf("[engine] StopAll: %s: %v", id, err)
+		}
 	}
 }
 
@@ -331,12 +334,13 @@ func (e *Engine) runSession(sess *Session) {
 	}
 }
 
-// runFFmpeg builds and runs the FFmpeg command for a given source -> outputs
+// runFFmpeg builds and runs the FFmpeg command for a given source -> outputs.
+// Uses SIGTERM for graceful shutdown instead of SIGKILL (exec.CommandContext default).
 func (e *Engine) runFFmpeg(sess *Session, source *types.Source) error {
 	args := e.buildArgs(source, sess.Flow.Outputs)
 	log.Printf("[flow:%s] ffmpeg %s", sess.FlowID, strings.Join(args, " "))
 
-	cmd := exec.CommandContext(sess.Ctx, e.ffmpegPath, args...)
+	cmd := exec.Command(e.ffmpegPath, args...)
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
 		return fmt.Errorf("stderr pipe: %w", err)
@@ -350,10 +354,32 @@ func (e *Engine) runFFmpeg(sess *Session, source *types.Source) error {
 		return fmt.Errorf("start ffmpeg: %w", err)
 	}
 
+	// Watch for context cancellation and send SIGTERM (not SIGKILL)
+	// so FFmpeg can flush buffers and close connections cleanly
+	waitDone := make(chan struct{})
+	go func() {
+		select {
+		case <-sess.Ctx.Done():
+			if cmd.Process != nil {
+				cmd.Process.Signal(syscall.SIGTERM)
+				// Give FFmpeg up to 5s to exit gracefully, then force kill
+				select {
+				case <-waitDone:
+				case <-time.After(5 * time.Second):
+					cmd.Process.Kill()
+				}
+			}
+		case <-waitDone:
+			// Process exited on its own
+		}
+	}()
+
 	// Monitor stderr for health - Connected will be set when we see actual data
 	e.monitorStderr(sess, source.Name, stderr)
 
 	err = cmd.Wait()
+	close(waitDone)
+
 	if sess.Ctx.Err() != nil {
 		return nil // intentional cancellation
 	}
@@ -444,6 +470,7 @@ var progressRe = regexp.MustCompile(`frame=\s*\d+`)
 // monitorStderr reads FFmpeg stderr to detect connection health
 func (e *Engine) monitorStderr(sess *Session, sourceName string, r io.Reader) {
 	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 256*1024), 256*1024) // 256KB max line
 	for scanner.Scan() {
 		line := scanner.Text()
 		log.Printf("[flow:%s] ffmpeg: %s", sess.FlowID, line)
