@@ -288,9 +288,46 @@ func (e *Engine) runSession(sess *Session) {
 			continue
 		}
 
-		// Clean exit (shouldn't happen for live streams normally)
-		e.emit(flowID, "source_eof", fmt.Sprintf("Source %s ended cleanly", source.Name), "info")
-		return
+		// Clean exit - for live streams this means the source stopped
+		// (e.g. UDP timeout with no more data). Treat as a failover trigger.
+		e.emit(flowID, "source_eof", fmt.Sprintf("Source %s ended (no more data)", source.Name), "warning")
+
+		sess.mu.Lock()
+		if h, ok := sess.SourceHealth[source.Name]; ok {
+			h.Connected = false
+		}
+		sess.mu.Unlock()
+
+		// Attempt failover if configured
+		if e.shouldFailover(sess.Flow) {
+			backup := e.getBackupSource(sess.Flow, source.Name)
+			if backup != nil {
+				sess.mu.Lock()
+				sess.ActiveSource = backup.Name
+				sess.FailoverCount++
+				sess.mu.Unlock()
+
+				e.emit(flowID, "source_failover",
+					fmt.Sprintf("Failover: %s -> %s (count: %d)", source.Name, backup.Name, sess.FailoverCount),
+					"warning")
+
+				select {
+				case <-time.After(200 * time.Millisecond):
+				case <-sess.Ctx.Done():
+					return
+				}
+				continue
+			}
+		}
+
+		// No failover - retry same source after delay
+		e.emit(flowID, "source_retry", fmt.Sprintf("Retrying source %s in 2s...", source.Name), "warning")
+		select {
+		case <-time.After(2 * time.Second):
+		case <-sess.Ctx.Done():
+			return
+		}
+		continue
 	}
 }
 
@@ -334,9 +371,6 @@ func (e *Engine) buildArgs(source *types.Source, outputs []*types.Output) []stri
 	// Source input args
 	args = append(args, e.sourceInputArgs(source)...)
 
-	// COPY - no transcoding, pure transport
-	args = append(args, "-c", "copy")
-
 	// Count enabled outputs
 	enabledOutputs := make([]*types.Output, 0)
 	for _, out := range outputs {
@@ -347,24 +381,16 @@ func (e *Engine) buildArgs(source *types.Source, outputs []*types.Output) []stri
 
 	// Guard: no enabled outputs - send to null
 	if len(enabledOutputs) == 0 {
-		args = append(args, "-f", "null", "-")
+		args = append(args, "-c", "copy", "-f", "null", "-")
 		return args
 	}
 
-	// Output args - each output is a separate destination
-	if len(enabledOutputs) == 1 {
-		out := enabledOutputs[0]
+	// Each output gets its own -c copy -f <format> <uri>
+	// This avoids tee muxer compatibility issues with stream copy
+	for _, out := range enabledOutputs {
+		args = append(args, "-c", "copy")
 		args = append(args, e.outputArgs(out)...)
 		args = append(args, out.BuildOutputURI())
-	} else {
-		// Multiple outputs: use tee muxer
-		args = append(args, "-f", "tee")
-		var teeTargets []string
-		for _, out := range enabledOutputs {
-			target := e.buildTeeTarget(out)
-			teeTargets = append(teeTargets, target)
-		}
-		args = append(args, strings.Join(teeTargets, "|"))
 	}
 
 	return args
@@ -410,20 +436,6 @@ func (e *Engine) outputArgs(out *types.Output) []string {
 		args = append(args, "-f", "mpegts")
 	}
 	return args
-}
-
-func (e *Engine) buildTeeTarget(out *types.Output) string {
-	uri := out.BuildOutputURI()
-	switch out.Protocol {
-	case types.ProtocolRTP, types.ProtocolRTPFEC:
-		return "[f=rtp]" + uri
-	case types.ProtocolUDP:
-		return "[f=mpegts]" + uri
-	case types.ProtocolRTMP:
-		return "[f=flv]" + uri
-	default:
-		return "[f=mpegts]" + uri
-	}
 }
 
 // Regex to detect FFmpeg progress lines like "frame= 123 fps= 25 ..."
