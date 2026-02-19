@@ -68,7 +68,6 @@ func (m *Monitor) StartMonitoring(flowID, sourceURI string, cfg *types.SourceMon
 		cancel:    cancel,
 		ctx:       ctx,
 		done:      make(chan struct{}),
-		quality:   &types.ContentQuality{},
 	}
 
 	m.sessions[flowID] = sess
@@ -219,8 +218,10 @@ func (m *Monitor) probeMetadata(sess *MonitorSession) {
 			"-print_format", "json",
 			"-show_streams",
 			"-show_programs",
+			"-fflags", "+genpts+discardcorrupt",
 			"-analyzeduration", "3000000",
 			"-probesize", "3000000",
+			"-f", "mpegts",
 			sess.sourceURI,
 		}
 
@@ -274,6 +275,8 @@ func (m *Monitor) runThumbnailCapture(sess *MonitorSession, intervalSec int) {
 		args := []string{
 			"-hide_banner",
 			"-loglevel", "error",
+			"-fflags", "+genpts+discardcorrupt",
+			"-f", "mpegts",
 			"-i", sess.sourceURI,
 			"-vframes", "1",
 			"-q:v", "5",
@@ -323,6 +326,8 @@ func (m *Monitor) runContentQuality(sess *MonitorSession) {
 		// Run a short analysis with detection filters
 		args := []string{
 			"-hide_banner",
+			"-fflags", "+genpts+discardcorrupt",
+			"-f", "mpegts",
 			"-i", sess.sourceURI,
 			"-t", "5", // analyze 5 seconds
 			"-vf", "blackdetect=d=0.5:pix_th=0.10,freezedetect=n=0.003:d=1",

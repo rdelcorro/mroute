@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"os/exec"
 	"regexp"
 	"strconv"
@@ -18,7 +19,9 @@ import (
 	"github.com/openclaw/mroute/pkg/types"
 )
 
-// Engine manages FFmpeg-based live transport for flows
+// Engine manages FFmpeg-based live transport for flows.
+// Architecture: Input FFmpeg → PacketRelay → Per-output FFmpeg processes.
+// This enables hitless output add/remove without interrupting the input stream.
 type Engine struct {
 	ffmpegPath  string
 	ffprobePath string
@@ -27,7 +30,16 @@ type Engine struct {
 	mu          sync.Mutex
 	onEvent     func(flowID, eventType, message, severity string)
 	eventMu     sync.RWMutex
-	nextMergePort int // allocator for merge output ports
+}
+
+// OutputProc represents a running per-output FFmpeg process
+type OutputProc struct {
+	Name      string
+	Output    *types.Output
+	Cmd       *exec.Cmd
+	Cancel    context.CancelFunc
+	LocalPort int
+	Done      chan struct{}
 }
 
 // Session represents a running flow's transport session
@@ -35,7 +47,7 @@ type Session struct {
 	FlowID        string
 	Flow          *types.Flow
 	ActiveSource  string
-	Cmd           *exec.Cmd
+	Cmd           *exec.Cmd // input FFmpeg command (for signalling on failover)
 	Cancel        context.CancelFunc
 	Ctx           context.Context
 	Done          chan struct{}
@@ -44,6 +56,8 @@ type Session struct {
 	SourceHealth  map[string]*SourceHealth
 	OutputHealth  map[string]*OutputHealth
 	Merger        *merge.RTPMerger // non-nil in MERGE mode
+	Relay         *PacketRelay     // fan-out relay between input and outputs
+	OutputProcs   map[string]*OutputProc
 	stopping      bool
 	mu            sync.RWMutex
 }
@@ -76,11 +90,10 @@ func NewEngine(ffmpegPath string, maxFlows int) *Engine {
 		maxFlows = 20
 	}
 	return &Engine{
-		ffmpegPath:    ffmpegPath,
-		ffprobePath:   "ffprobe",
-		maxFlows:      maxFlows,
-		sessions:      make(map[string]*Session),
-		nextMergePort: 17000, // merge output ports start here
+		ffmpegPath:  ffmpegPath,
+		ffprobePath: "ffprobe",
+		maxFlows:    maxFlows,
+		sessions:    make(map[string]*Session),
 	}
 }
 
@@ -94,14 +107,85 @@ func (e *Engine) SetEventCallback(cb func(flowID, eventType, message, severity s
 	e.eventMu.Unlock()
 }
 
-// allocMergePort returns a unique local port for merge output
-func (e *Engine) allocMergePort() int {
-	port := e.nextMergePort
-	e.nextMergePort++
-	return port
+// GetMonitorURI adds a monitoring tap to a running flow's relay and returns a URI to read from.
+// Returns empty string if the flow is not running or has no relay.
+func (e *Engine) GetMonitorURI(flowID string) string {
+	e.mu.Lock()
+	sess, ok := e.sessions[flowID]
+	e.mu.Unlock()
+	if !ok || sess.Relay == nil {
+		return ""
+	}
+
+	// Reuse existing monitor output if already registered
+	if sess.Relay.HasOutput("__monitor") {
+		sess.mu.RLock()
+		proc, exists := sess.OutputProcs["__monitor_meta"]
+		sess.mu.RUnlock()
+		if exists {
+			return fmt.Sprintf("udp://127.0.0.1:%d", proc.LocalPort)
+		}
+	}
+
+	port, err := e.allocOutputPort()
+	if err != nil {
+		log.Printf("[flow:%s] failed to alloc monitor port: %v", flowID, err)
+		return ""
+	}
+
+	if err := sess.Relay.AddOutput("__monitor", port); err != nil {
+		log.Printf("[flow:%s] failed to add monitor relay output: %v", flowID, err)
+		return ""
+	}
+
+	// Track the port so we can return it on subsequent calls
+	sess.mu.Lock()
+	sess.OutputProcs["__monitor_meta"] = &OutputProc{
+		Name:      "__monitor_meta",
+		LocalPort: port,
+		Done:      make(chan struct{}),
+	}
+	sess.mu.Unlock()
+
+	return fmt.Sprintf("udp://127.0.0.1:%d", port)
+}
+
+// RemoveMonitorURI removes the monitoring tap from a running flow's relay.
+func (e *Engine) RemoveMonitorURI(flowID string) {
+	e.mu.Lock()
+	sess, ok := e.sessions[flowID]
+	e.mu.Unlock()
+	if !ok || sess.Relay == nil {
+		return
+	}
+	sess.Relay.RemoveOutput("__monitor")
+	sess.mu.Lock()
+	delete(sess.OutputProcs, "__monitor_meta")
+	sess.mu.Unlock()
+}
+
+// allocMergePort returns a free local UDP port for merge output
+func (e *Engine) allocMergePort() (int, error) {
+	return e.allocOutputPort()
+}
+
+// allocOutputPort returns a free local UDP port by binding to port 0 and releasing.
+func (e *Engine) allocOutputPort() (int, error) {
+	addr, err := net.ResolveUDPAddr("udp", "127.0.0.1:0")
+	if err != nil {
+		return 0, fmt.Errorf("resolve UDP addr: %w", err)
+	}
+	conn, err := net.ListenUDP("udp", addr)
+	if err != nil {
+		return 0, fmt.Errorf("listen UDP: %w", err)
+	}
+	port := conn.LocalAddr().(*net.UDPAddr).Port
+	conn.Close()
+	return port, nil
 }
 
 // StartFlow starts live transport for a flow.
+// Creates a PacketRelay, starts per-output FFmpeg processes, then starts the input FFmpeg.
 func (e *Engine) StartFlow(flow *types.Flow) error {
 	flowCopy := flow.DeepCopy()
 
@@ -130,6 +214,7 @@ func (e *Engine) StartFlow(flow *types.Flow) error {
 		Started:      time.Now(),
 		SourceHealth: make(map[string]*SourceHealth),
 		OutputHealth: make(map[string]*OutputHealth),
+		OutputProcs:  make(map[string]*OutputProc),
 	}
 
 	// Init health tracking
@@ -146,8 +231,27 @@ func (e *Engine) StartFlow(flow *types.Flow) error {
 		sess.ActiveSource = activeSource.Name
 	}
 
+	// Create and start packet relay
+	relay := NewPacketRelay()
+	if err := relay.Start(); err != nil {
+		cancel()
+		e.mu.Unlock()
+		return fmt.Errorf("start relay: %w", err)
+	}
+	sess.Relay = relay
+
 	e.sessions[flowCopy.ID] = sess
 	e.mu.Unlock()
+
+	// Start per-output FFmpeg processes (relay fans out to each)
+	for _, out := range flowCopy.Outputs {
+		if out.Status == types.OutputDisabled {
+			continue
+		}
+		if _, err := e.startOutputProc(sess, out); err != nil {
+			log.Printf("[flow:%s] Failed to start output %s: %v", flowCopy.ID, out.Name, err)
+		}
+	}
 
 	// Choose session mode based on failover config
 	if e.isMergeMode(flowCopy) && len(allSources) >= 2 {
@@ -182,7 +286,6 @@ func (e *Engine) StopFlow(flowID string) error {
 	case <-sess.Done:
 	case <-time.After(15 * time.Second):
 		log.Printf("[flow:%s] stop timed out", flowID)
-		// Force cleanup if timed out (goroutine may be stuck)
 		e.mu.Lock()
 		delete(e.sessions, flowID)
 		e.mu.Unlock()
@@ -290,11 +393,179 @@ func (e *Engine) StopAll() {
 	}
 }
 
+// ===== PER-OUTPUT FFmpeg MANAGEMENT =====
+
+// startOutputProc starts a per-output FFmpeg process and registers it in the relay.
+// The output FFmpeg reads from a local UDP port and writes to the output destination.
+func (e *Engine) startOutputProc(sess *Session, output *types.Output) (*OutputProc, error) {
+	localPort, err := e.allocOutputPort()
+	if err != nil {
+		return nil, fmt.Errorf("alloc output port: %w", err)
+	}
+
+	args := e.buildOutputArgs(localPort, output)
+	log.Printf("[flow:%s] output %s: ffmpeg %s", sess.FlowID, output.Name, strings.Join(args, " "))
+
+	ctx, cancel := context.WithCancel(sess.Ctx)
+	cmd := exec.CommandContext(ctx, e.ffmpegPath, args...)
+	// Use process group so child processes are also killed on cancel
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	// Send SIGTERM instead of SIGKILL for graceful shutdown
+	cmd.Cancel = func() error {
+		if cmd.Process != nil {
+			return cmd.Process.Signal(syscall.SIGTERM)
+		}
+		return nil
+	}
+	cmd.WaitDelay = 5 * time.Second
+
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("stderr pipe: %w", err)
+	}
+
+	if err := cmd.Start(); err != nil {
+		cancel()
+		return nil, fmt.Errorf("start output ffmpeg: %w", err)
+	}
+
+	proc := &OutputProc{
+		Name:      output.Name,
+		Output:    output,
+		Cmd:       cmd,
+		Cancel:    cancel,
+		LocalPort: localPort,
+		Done:      make(chan struct{}),
+	}
+
+	go func() {
+		defer close(proc.Done)
+		e.monitorOutputStderr(sess, output.Name, stderr)
+		cmd.Wait()
+	}()
+
+	// Atomically check for duplicate and insert
+	sess.mu.Lock()
+	if _, exists := sess.OutputProcs[output.Name]; exists {
+		sess.mu.Unlock()
+		cancel()
+		<-proc.Done
+		return nil, fmt.Errorf("output %s already running (race)", output.Name)
+	}
+	sess.OutputProcs[output.Name] = proc
+	sess.mu.Unlock()
+
+	// Brief pause for FFmpeg to bind its UDP listener, then register in relay
+	time.Sleep(300 * time.Millisecond)
+
+	if err := sess.Relay.AddOutput(output.Name, localPort); err != nil {
+		cancel()
+		<-proc.Done
+		sess.mu.Lock()
+		delete(sess.OutputProcs, output.Name)
+		sess.mu.Unlock()
+		return nil, fmt.Errorf("add to relay: %w", err)
+	}
+
+	return proc, nil
+}
+
+// stopOutputProc removes an output from the relay and stops its FFmpeg process
+func (e *Engine) stopOutputProc(sess *Session, name string) {
+	sess.mu.Lock()
+	proc, ok := sess.OutputProcs[name]
+	if !ok {
+		sess.mu.Unlock()
+		return
+	}
+	delete(sess.OutputProcs, name)
+	sess.mu.Unlock()
+
+	// Remove from relay first (stop sending packets)
+	if sess.Relay != nil {
+		sess.Relay.RemoveOutput(name)
+	}
+
+	// Then stop the FFmpeg process
+	proc.Cancel()
+	select {
+	case <-proc.Done:
+	case <-time.After(5 * time.Second):
+		if proc.Cmd.Process != nil {
+			syscall.Kill(-proc.Cmd.Process.Pid, syscall.SIGKILL)
+		}
+		<-proc.Done
+	}
+}
+
+// AddOutputToRunning hot-adds an output to a running flow without interrupting other outputs or the input
+func (e *Engine) AddOutputToRunning(flowID string, output *types.Output) error {
+	e.mu.Lock()
+	sess, ok := e.sessions[flowID]
+	e.mu.Unlock()
+	if !ok {
+		return fmt.Errorf("flow %s is not running", flowID)
+	}
+
+	// startOutputProc does the duplicate check atomically under write lock
+	proc, err := e.startOutputProc(sess, output)
+	if err != nil {
+		return err
+	}
+
+	sess.mu.Lock()
+	sess.OutputHealth[output.Name] = &OutputHealth{Name: output.Name}
+	sess.mu.Unlock()
+
+	e.emit(flowID, "output_added", fmt.Sprintf("Hot-added output %s (relay port %d)", output.Name, proc.LocalPort), "info")
+	return nil
+}
+
+// RemoveOutputFromRunning hot-removes an output from a running flow without interrupting other outputs or the input
+func (e *Engine) RemoveOutputFromRunning(flowID string, outputName string) error {
+	e.mu.Lock()
+	sess, ok := e.sessions[flowID]
+	e.mu.Unlock()
+	if !ok {
+		return fmt.Errorf("flow %s is not running", flowID)
+	}
+
+	e.stopOutputProc(sess, outputName)
+
+	sess.mu.Lock()
+	delete(sess.OutputHealth, outputName)
+	sess.mu.Unlock()
+
+	e.emit(flowID, "output_removed", fmt.Sprintf("Hot-removed output %s", outputName), "info")
+	return nil
+}
+
 // ===== MERGE MODE =====
-// Runs both sources through RTPMerger, feeds merged stream to FFmpeg
 
 func (e *Engine) runMergeSession(sess *Session) {
 	defer func() {
+		// Stop all output procs (including __monitor_meta tracking entry)
+		sess.mu.RLock()
+		names := make([]string, 0, len(sess.OutputProcs))
+		for name := range sess.OutputProcs {
+			names = append(names, name)
+		}
+		sess.mu.RUnlock()
+		for _, name := range names {
+			if name == "__monitor_meta" {
+				// Just remove the tracking entry, relay.Stop handles the connection
+				sess.mu.Lock()
+				delete(sess.OutputProcs, name)
+				sess.mu.Unlock()
+				continue
+			}
+			e.stopOutputProc(sess, name)
+		}
+		if sess.Relay != nil {
+			sess.Relay.Stop()
+		}
+
 		e.mu.Lock()
 		delete(e.sessions, sess.FlowID)
 		e.mu.Unlock()
@@ -311,10 +582,11 @@ func (e *Engine) runMergeSession(sess *Session) {
 	srcA := sources[0]
 	srcB := sources[1]
 
-	// Allocate a local port for merged output
-	e.mu.Lock()
-	mergePort := e.allocMergePort()
-	e.mu.Unlock()
+	mergePort, err := e.allocMergePort()
+	if err != nil {
+		e.emit(flowID, "error", fmt.Sprintf("Failed to alloc merge port: %v", err), "error")
+		return
+	}
 
 	recoveryMs := 100
 	if sess.Flow.SourceFailoverConfig != nil && sess.Flow.SourceFailoverConfig.RecoveryWindow > 0 {
@@ -337,16 +609,14 @@ func (e *Engine) runMergeSession(sess *Session) {
 	e.emit(flowID, "merge_started", fmt.Sprintf("MERGE mode: %s (port %d) + %s (port %d) -> merged (port %d, recovery=%dms)",
 		srcA.Name, srcA.IngestPort, srcB.Name, srcB.IngestPort, mergePort, recoveryMs), "info")
 
-	// Create a synthetic source that reads from the merged local port
 	mergedSource := &types.Source{
 		Name:       "merged",
-		Protocol:   types.ProtocolUDP, // merged output is raw UDP
+		Protocol:   types.ProtocolUDP,
 		IngestPort: mergePort,
 	}
 
-	// Run FFmpeg reading from merged stream
 	for {
-		err := e.runFFmpeg(sess, mergedSource)
+		err := e.runInputFFmpeg(sess, mergedSource)
 		if sess.Ctx.Err() != nil {
 			e.emit(flowID, "flow_stopped", "Merge flow transport stopped", "info")
 			return
@@ -358,7 +628,6 @@ func (e *Engine) runMergeSession(sess *Session) {
 			e.emit(flowID, "merge_eof", "Merged stream ended", "warning")
 		}
 
-		// Update merge stats into source health
 		stats := merger.Stats()
 		sess.mu.Lock()
 		if h, ok := sess.SourceHealth[srcA.Name]; ok {
@@ -380,10 +649,29 @@ func (e *Engine) runMergeSession(sess *Session) {
 }
 
 // ===== FAILOVER MODE =====
-// Standard failover with auto-recovery to primary
 
 func (e *Engine) runFailoverSession(sess *Session) {
 	defer func() {
+		// Stop all output procs (including __monitor_meta tracking entry)
+		sess.mu.RLock()
+		names := make([]string, 0, len(sess.OutputProcs))
+		for name := range sess.OutputProcs {
+			names = append(names, name)
+		}
+		sess.mu.RUnlock()
+		for _, name := range names {
+			if name == "__monitor_meta" {
+				sess.mu.Lock()
+				delete(sess.OutputProcs, name)
+				sess.mu.Unlock()
+				continue
+			}
+			e.stopOutputProc(sess, name)
+		}
+		if sess.Relay != nil {
+			sess.Relay.Stop()
+		}
+
 		e.mu.Lock()
 		delete(e.sessions, sess.FlowID)
 		e.mu.Unlock()
@@ -391,26 +679,42 @@ func (e *Engine) runFailoverSession(sess *Session) {
 	}()
 	flowID := sess.FlowID
 
-	// Start auto-recovery probe if configured with a primary source
 	primaryName := e.getPrimarySourceName(sess.Flow)
 	if primaryName != "" {
 		go e.probeForPrimaryRecovery(sess, primaryName)
 	}
 
 	for {
-		source := e.findSource(sess.Flow, sess.ActiveSource)
+		sess.mu.RLock()
+		activeName := sess.ActiveSource
+		sess.mu.RUnlock()
+
+		source := e.findSource(sess.Flow, activeName)
 		if source == nil {
-			e.emit(flowID, "error", "active source not found: "+sess.ActiveSource, "error")
+			e.emit(flowID, "error", "active source not found: "+activeName, "error")
 			return
 		}
 
 		e.emit(flowID, "source_active", fmt.Sprintf("Using source: %s (%s on port %d)", source.Name, source.Protocol, source.IngestPort), "info")
 
-		err := e.runFFmpeg(sess, source)
+		err := e.runInputFFmpeg(sess, source)
 
 		if sess.Ctx.Err() != nil {
 			e.emit(flowID, "flow_stopped", "Flow transport stopped", "info")
 			return
+		}
+
+		// Check if active source was changed externally (e.g., by recovery probe)
+		sess.mu.RLock()
+		currentActive := sess.ActiveSource
+		sess.mu.RUnlock()
+		if currentActive != activeName {
+			select {
+			case <-time.After(200 * time.Millisecond):
+			case <-sess.Ctx.Done():
+				return
+			}
+			continue
 		}
 
 		if err != nil {
@@ -504,19 +808,17 @@ func (e *Engine) probeForPrimaryRecovery(sess *Session, primaryName string) {
 		select {
 		case <-sess.Ctx.Done():
 			return
-		case <-time.After(3 * time.Second): // probe every 3 seconds
+		case <-time.After(3 * time.Second):
 		}
 
 		sess.mu.RLock()
 		currentActive := sess.ActiveSource
 		sess.mu.RUnlock()
 
-		// Only probe when we're NOT on the primary
 		if currentActive == primaryName {
 			continue
 		}
 
-		// Try to detect data on the primary source
 		if e.probeSourceAlive(primarySource, 2*time.Second) {
 			e.emit(sess.FlowID, "primary_recovered",
 				fmt.Sprintf("Primary source %s recovered, switching back", primaryName), "info")
@@ -524,13 +826,10 @@ func (e *Engine) probeForPrimaryRecovery(sess *Session, primaryName string) {
 			sess.mu.Lock()
 			sess.ActiveSource = primaryName
 			sess.FailoverCount++
+			cmd := sess.Cmd
 			sess.mu.Unlock()
 
-			// The main loop will pick up the new ActiveSource on its next iteration
-			// We need to interrupt the current FFmpeg to trigger the switch
-			sess.mu.RLock()
-			cmd := sess.Cmd
-			sess.mu.RUnlock()
+			// Interrupt the current input FFmpeg to trigger the switch
 			if cmd != nil && cmd.Process != nil {
 				cmd.Process.Signal(syscall.SIGTERM)
 			}
@@ -546,7 +845,7 @@ func (e *Engine) probeSourceAlive(source *types.Source, timeout time.Duration) b
 	uri := source.BuildSourceURI()
 	cmd := exec.CommandContext(ctx, e.ffprobePath,
 		"-v", "quiet",
-		"-analyzeduration", "500000", // 500ms
+		"-analyzeduration", "500000",
 		"-probesize", "32768",
 		"-i", uri,
 	)
@@ -554,25 +853,28 @@ func (e *Engine) probeSourceAlive(source *types.Source, timeout time.Duration) b
 	return err == nil
 }
 
-// ===== FFmpeg Execution =====
+// ===== INPUT FFmpeg =====
 
-func (e *Engine) runFFmpeg(sess *Session, source *types.Source) error {
-	args := e.buildArgs(source, sess.Flow.Outputs)
-	log.Printf("[flow:%s] ffmpeg %s", sess.FlowID, strings.Join(args, " "))
+// runInputFFmpeg runs the input-side FFmpeg: reads from source, writes to relay's input port
+func (e *Engine) runInputFFmpeg(sess *Session, source *types.Source) error {
+	args := e.buildInputArgs(source, sess.Relay.InputPort())
+	log.Printf("[flow:%s] input ffmpeg %s", sess.FlowID, strings.Join(args, " "))
 
 	cmd := exec.Command(e.ffmpegPath, args...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
 		return fmt.Errorf("stderr pipe: %w", err)
 	}
 
-	sess.mu.Lock()
-	sess.Cmd = cmd
-	sess.mu.Unlock()
-
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start ffmpeg: %w", err)
 	}
+
+	// Set sess.Cmd AFTER Start so the process handle is valid
+	sess.mu.Lock()
+	sess.Cmd = cmd
+	sess.mu.Unlock()
 
 	waitDone := make(chan struct{})
 	go func() {
@@ -583,7 +885,7 @@ func (e *Engine) runFFmpeg(sess *Session, source *types.Source) error {
 				select {
 				case <-waitDone:
 				case <-time.After(5 * time.Second):
-					cmd.Process.Kill()
+					syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 				}
 			}
 		case <-waitDone:
@@ -595,38 +897,53 @@ func (e *Engine) runFFmpeg(sess *Session, source *types.Source) error {
 	err = cmd.Wait()
 	close(waitDone)
 
+	// Clear sess.Cmd after process exits
+	sess.mu.Lock()
+	if sess.Cmd == cmd {
+		sess.Cmd = nil
+	}
+	sess.mu.Unlock()
+
 	if sess.Ctx.Err() != nil {
 		return nil
 	}
 	return err
 }
 
-func (e *Engine) buildArgs(source *types.Source, outputs []*types.Output) []string {
+// buildInputArgs constructs FFmpeg args for reading from a source and writing to the relay
+func (e *Engine) buildInputArgs(source *types.Source, relayPort int) []string {
 	args := []string{
 		"-hide_banner",
 		"-loglevel", "warning",
-		"-stats",
+		"-nostats",
+		"-fflags", "+genpts+discardcorrupt",
 	}
 
 	args = append(args, e.sourceInputArgs(source)...)
 
-	enabledOutputs := make([]*types.Output, 0)
-	for _, out := range outputs {
-		if out.Status != types.OutputDisabled {
-			enabledOutputs = append(enabledOutputs, out)
-		}
+	// Output to relay's input port as mpegts over UDP
+	args = append(args, "-c", "copy", "-f", "mpegts",
+		fmt.Sprintf("udp://127.0.0.1:%d?pkt_size=1316", relayPort))
+
+	return args
+}
+
+// buildOutputArgs constructs FFmpeg args for reading from a local relay port and writing to an output.
+func (e *Engine) buildOutputArgs(localPort int, output *types.Output) []string {
+	args := []string{
+		"-hide_banner",
+		"-loglevel", "warning",
+		"-nostats",
+		"-fflags", "+genpts+discardcorrupt",
+		"-probesize", "32768",
+		"-analyzeduration", "2000000",
+		"-f", "mpegts",
+		"-i", fmt.Sprintf("udp://127.0.0.1:%d?timeout=30000000&fifo_size=131072&overrun_nonfatal=1&buffer_size=65536", localPort),
+		"-c", "copy",
 	}
 
-	if len(enabledOutputs) == 0 {
-		args = append(args, "-c", "copy", "-f", "null", "-")
-		return args
-	}
-
-	for _, out := range enabledOutputs {
-		args = append(args, "-c", "copy")
-		args = append(args, e.outputArgs(out)...)
-		args = append(args, out.BuildOutputURI())
-	}
+	args = append(args, e.outputArgs(output)...)
+	args = append(args, output.BuildOutputURI())
 
 	return args
 }
@@ -640,8 +957,11 @@ func (e *Engine) sourceInputArgs(source *types.Source) []string {
 	case types.ProtocolRTP, types.ProtocolRTPFEC:
 		args = append(args, "-protocol_whitelist", "file,rtp,udp")
 	case types.ProtocolUDP:
+		args = append(args, "-f", "mpegts")
+		args = append(args, "-probesize", "5000000")
+		args = append(args, "-analyzeduration", "5000000")
 		args = append(args, "-buffer_size", "65536")
-		args = append(args, "-timeout", "5000000")
+		args = append(args, "-timeout", "10000000") // 10s read timeout for source loss detection
 	case types.ProtocolRIST:
 		args = append(args, "-f", "mpegts")
 	case types.ProtocolRTMP:
@@ -701,19 +1021,9 @@ func (e *Engine) monitorStderr(sess *Session, sourceName string, r io.Reader) {
 					}
 				}
 
-				// Parse drop count
 				if m := dropRe.FindStringSubmatch(line); len(m) > 1 {
 					if v, err := strconv.ParseInt(m[1], 10, 64); err == nil {
 						h.PacketsLost = v
-					}
-				}
-			}
-
-			// Mark all enabled outputs as connected when we see data flowing
-			for _, out := range sess.Flow.Outputs {
-				if out.Status != types.OutputDisabled {
-					if oh, ok := sess.OutputHealth[out.Name]; ok {
-						oh.Connected = true
 					}
 				}
 			}
@@ -727,7 +1037,6 @@ func (e *Engine) monitorStderr(sess *Session, sourceName string, r io.Reader) {
 			e.emit(sess.FlowID, "connection_error", line, "error")
 		}
 
-		// Detect SRT-specific stats
 		if strings.Contains(lower, "rtt=") {
 			if idx := strings.Index(lower, "rtt="); idx >= 0 {
 				rttStr := lower[idx+4:]
@@ -742,6 +1051,35 @@ func (e *Engine) monitorStderr(sess *Session, sourceName string, r io.Reader) {
 				}
 				sess.mu.Unlock()
 			}
+		}
+	}
+}
+
+func (e *Engine) monitorOutputStderr(sess *Session, outputName string, r io.Reader) {
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 64*1024), 64*1024)
+	for scanner.Scan() {
+		line := scanner.Text()
+		log.Printf("[flow:%s] output %s: %s", sess.FlowID, outputName, line)
+
+		if progressRe.MatchString(line) {
+			sess.mu.Lock()
+			if oh, ok := sess.OutputHealth[outputName]; ok {
+				oh.Connected = true
+			}
+			sess.mu.Unlock()
+		}
+
+		lower := strings.ToLower(line)
+		if strings.Contains(lower, "connection refused") ||
+			strings.Contains(lower, "connection timed out") ||
+			strings.Contains(lower, "no route to host") {
+			sess.mu.Lock()
+			if oh, ok := sess.OutputHealth[outputName]; ok {
+				oh.Connected = false
+				oh.Disconnections++
+			}
+			sess.mu.Unlock()
 		}
 	}
 }

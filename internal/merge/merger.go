@@ -33,6 +33,7 @@ type RTPMerger struct {
 
 	stopCh chan struct{}
 	done   chan struct{}
+	recvWg sync.WaitGroup
 }
 
 type rtpPacket struct {
@@ -112,8 +113,9 @@ func (m *RTPMerger) Start() error {
 	m.started = true
 
 	// Start receiver goroutines
-	go m.receiveLoop(m.connA, true)
-	go m.receiveLoop(m.connB, false)
+	m.recvWg.Add(2)
+	go func() { defer m.recvWg.Done(); m.receiveLoop(m.connA, true) }()
+	go func() { defer m.recvWg.Done(); m.receiveLoop(m.connB, false) }()
 
 	// Start output goroutine
 	go m.outputLoop()
@@ -132,6 +134,7 @@ func (m *RTPMerger) Stop() {
 	m.connA.Close()
 	m.connB.Close()
 	m.outputConn.Close()
+	m.recvWg.Wait()
 	<-m.done
 }
 
@@ -245,6 +248,8 @@ func (m *RTPMerger) outputLoop() {
 	ticker := time.NewTicker(200 * time.Microsecond) // 5000 packets/sec check rate
 	defer ticker.Stop()
 
+	pruneCounter := 0
+
 	for {
 		select {
 		case <-m.stopCh:
@@ -256,30 +261,28 @@ func (m *RTPMerger) outputLoop() {
 			continue
 		}
 
+		// Process a bounded batch per iteration to limit lock hold time
 		m.bufMu.Lock()
 
-		// Try to output packets in sequence order
-		for {
+		sent := 0
+		skipped := 0
+		const maxBatch = 64
+
+		for sent+skipped < maxBatch {
 			pkt, ok := m.buffer[m.nextSeq]
 			if ok {
-				// Got the next packet - send it
 				m.outputConn.Write(pkt.data)
 				delete(m.buffer, m.nextSeq)
 				m.nextSeq++
-				m.statsMu.Lock()
-				m.outputCount++
-				m.statsMu.Unlock()
+				sent++
 				continue
 			}
 
 			// Packet missing - check if we should wait or skip
-			// Look at the oldest buffered packet to see how far ahead we are
 			oldestWait := time.Duration(0)
 			for _, p := range m.buffer {
-				// Check sequence distance (with wrapping)
 				dist := seqDistance(m.nextSeq, p.seq)
 				if dist > 0 && dist < 1000 {
-					// There are future packets buffered, meaning this gap has had time
 					elapsed := time.Since(p.arrivedAt)
 					if elapsed > oldestWait {
 						oldestWait = elapsed
@@ -288,26 +291,36 @@ func (m *RTPMerger) outputLoop() {
 			}
 
 			if oldestWait > recoveryDuration {
-				// Recovery window exceeded - skip this packet
-				m.statsMu.Lock()
-				m.missingCount++
-				m.statsMu.Unlock()
+				skipped++
 				m.nextSeq++
 				continue
 			}
 
-			// Still within recovery window, wait for it
 			break
 		}
 
-		// Prune very old buffer entries (more than 5x recovery window behind)
-		for seq := range m.buffer {
-			if seqDistance(seq, m.nextSeq) > 5000 {
-				delete(m.buffer, seq)
-			}
+		m.bufMu.Unlock()
+
+		// Update stats outside the buffer lock
+		if sent > 0 || skipped > 0 {
+			m.statsMu.Lock()
+			m.outputCount += int64(sent)
+			m.missingCount += int64(skipped)
+			m.statsMu.Unlock()
 		}
 
-		m.bufMu.Unlock()
+		// Prune stale entries periodically (every ~100 ticks)
+		pruneCounter++
+		if pruneCounter >= 100 {
+			pruneCounter = 0
+			m.bufMu.Lock()
+			for seq := range m.buffer {
+				if seqDistance(seq, m.nextSeq) > 5000 {
+					delete(m.buffer, seq)
+				}
+			}
+			m.bufMu.Unlock()
+		}
 	}
 }
 

@@ -20,12 +20,13 @@ import (
 
 // Manager handles flow lifecycle and persistence
 type Manager struct {
-	db      *sql.DB
-	engine  *transport.Engine
-	monitor *monitor.Monitor // optional: thumbnails, metadata, content quality
-	onEvent func(flowID, eventType, message, severity string)
-	eventMu sync.RWMutex // protects onEvent callback
-	stopMW  chan struct{} // stops maintenance window scheduler
+	db       *sql.DB
+	engine   *transport.Engine
+	monitor  *monitor.Monitor // optional: thumbnails, metadata, content quality
+	onEvent  func(flowID, eventType, message, severity string)
+	eventMu  sync.RWMutex // protects onEvent callback
+	stopMW   chan struct{} // stops maintenance window scheduler
+	closeOnce sync.Once
 }
 
 func NewManager(dsn string, engine *transport.Engine, mon *monitor.Monitor) (*Manager, error) {
@@ -66,8 +67,12 @@ func NewManager(dsn string, engine *transport.Engine, mon *monitor.Monitor) (*Ma
 }
 
 func (m *Manager) Close() error {
-	close(m.stopMW)
-	return m.db.Close()
+	var err error
+	m.closeOnce.Do(func() {
+		close(m.stopMW)
+		err = m.db.Close()
+	})
+	return err
 }
 
 func (m *Manager) SetEventCallback(cb func(flowID, eventType, message, severity string)) {
@@ -307,10 +312,18 @@ func (m *Manager) StartFlow(id string) error {
 	}
 
 	// Start source monitoring (thumbnails, metadata, content quality)
+	// Use relay-based URI so the monitor doesn't compete with the input FFmpeg for the source port
 	if m.monitor != nil {
-		src := m.primarySource(flow)
-		if src != nil {
-			m.monitor.StartMonitoring(id, src.BuildSourceURI(), flow.SourceMonitorConfig)
+		monitorURI := m.engine.GetMonitorURI(id)
+		if monitorURI == "" {
+			// Fallback to source URI if no relay available
+			src := m.primarySource(flow)
+			if src != nil {
+				monitorURI = src.BuildSourceURI()
+			}
+		}
+		if monitorURI != "" {
+			m.monitor.StartMonitoring(id, monitorURI, flow.SourceMonitorConfig)
 		}
 	}
 
@@ -338,6 +351,8 @@ func (m *Manager) StopFlow(id string) error {
 	if m.monitor != nil {
 		m.monitor.StopMonitoring(id)
 	}
+	// Clean up monitor relay tap
+	m.engine.RemoveMonitorURI(id)
 
 	if err := m.engine.StopFlow(id); err != nil {
 		// might already be stopped, that's ok
@@ -382,7 +397,12 @@ func (m *Manager) AddSource(flowID string, source *types.Source) error {
 	source.Status = types.SourceDisconnected
 	flow.Sources = append(flow.Sources, source)
 	flow.UpdatedAt = time.Now()
-	return m.saveFlow(flow)
+	if err := m.saveFlow(flow); err != nil {
+		return err
+	}
+	// Source changes require a full restart (input FFmpeg must be reconfigured)
+	// Outputs remain running through the relay during the restart.
+	return m.restartInputIfRunning(flowID)
 }
 
 // RemoveSource removes a source from a flow
@@ -422,10 +442,79 @@ func (m *Manager) RemoveSource(flowID, sourceName string) error {
 	}
 
 	flow.UpdatedAt = time.Now()
-	return m.saveFlow(flow)
+	if err := m.saveFlow(flow); err != nil {
+		return err
+	}
+	// Source changes require a full restart
+	return m.restartInputIfRunning(flowID)
 }
 
-// AddOutput adds an output to a flow
+// restartInputIfRunning fully restarts a running flow to pick up source config changes.
+// Output FFmpeg processes are recreated, but this is only needed for source changes.
+// For output-only changes, use AddOutputToRunning/RemoveOutputFromRunning directly.
+func (m *Manager) restartInputIfRunning(id string) error {
+	if !m.engine.IsRunning(id) {
+		return nil
+	}
+
+	// Stop monitoring
+	if m.monitor != nil {
+		m.monitor.StopMonitoring(id)
+	}
+
+	// Stop transport
+	if err := m.engine.StopFlow(id); err != nil {
+		log.Printf("[flow:%s] restart: stop error: %v", id, err)
+	}
+
+	// Brief pause for clean shutdown
+	time.Sleep(500 * time.Millisecond)
+
+	// Reload flow from DB (has updated config)
+	flow, err := m.GetFlow(id)
+	if err != nil {
+		return fmt.Errorf("restart: get flow: %w", err)
+	}
+
+	// Override status (GetFlow may have set it to ERROR since engine was briefly stopped)
+	flow.Status = types.FlowStarting
+	flow.UpdatedAt = time.Now()
+	if err := m.saveFlow(flow); err != nil {
+		return fmt.Errorf("restart: save starting state: %w", err)
+	}
+
+	// Restart transport with updated config
+	if err := m.engine.StartFlow(flow); err != nil {
+		flow.Status = types.FlowError
+		m.saveFlow(flow)
+		return fmt.Errorf("restart: start flow: %w", err)
+	}
+
+	// Restart monitoring via relay tap
+	if m.monitor != nil {
+		monitorURI := m.engine.GetMonitorURI(id)
+		if monitorURI == "" {
+			src := m.primarySource(flow)
+			if src != nil {
+				monitorURI = src.BuildSourceURI()
+			}
+		}
+		if monitorURI != "" {
+			m.monitor.StartMonitoring(id, monitorURI, flow.SourceMonitorConfig)
+		}
+	}
+
+	flow.Status = types.FlowActive
+	if err := m.saveFlow(flow); err != nil {
+		log.Printf("[flow:%s] restart: save active state: %v", id, err)
+	}
+
+	m.recordEvent(id, "flow_restarted", "Flow restarted due to source configuration change", "info")
+	return nil
+}
+
+// AddOutput adds an output to a flow. If the flow is running, the output is hot-added
+// without interrupting existing outputs or the input stream.
 func (m *Manager) AddOutput(flowID string, output *types.Output) error {
 	flow, err := m.GetFlow(flowID)
 	if err != nil {
@@ -447,10 +536,20 @@ func (m *Manager) AddOutput(flowID string, output *types.Output) error {
 	}
 	flow.Outputs = append(flow.Outputs, output)
 	flow.UpdatedAt = time.Now()
-	return m.saveFlow(flow)
+	if err := m.saveFlow(flow); err != nil {
+		return err
+	}
+	// Hot-add to running flow (no-op if not running)
+	if m.engine.IsRunning(flowID) && output.Status != types.OutputDisabled {
+		if err := m.engine.AddOutputToRunning(flowID, output); err != nil {
+			log.Printf("[flow:%s] hot-add output %s failed: %v", flowID, output.Name, err)
+		}
+	}
+	return nil
 }
 
-// RemoveOutput removes an output from a flow
+// RemoveOutput removes an output from a flow. If the flow is running, the output is hot-removed
+// without interrupting other outputs or the input stream.
 func (m *Manager) RemoveOutput(flowID, outputName string) error {
 	flow, err := m.GetFlow(flowID)
 	if err != nil {
@@ -470,10 +569,20 @@ func (m *Manager) RemoveOutput(flowID, outputName string) error {
 	}
 	flow.Outputs = newOutputs
 	flow.UpdatedAt = time.Now()
-	return m.saveFlow(flow)
+	if err := m.saveFlow(flow); err != nil {
+		return err
+	}
+	// Hot-remove from running flow (no-op if not running)
+	if m.engine.IsRunning(flowID) {
+		if err := m.engine.RemoveOutputFromRunning(flowID, outputName); err != nil {
+			log.Printf("[flow:%s] hot-remove output %s failed: %v", flowID, outputName, err)
+		}
+	}
+	return nil
 }
 
-// UpdateOutput updates an existing output
+// UpdateOutput updates an existing output. If the flow is running, the output is hot-swapped
+// (removed and re-added) without interrupting other outputs or the input stream.
 func (m *Manager) UpdateOutput(flowID, outputName string, updates *types.Output) error {
 	flow, err := m.GetFlow(flowID)
 	if err != nil {
@@ -504,7 +613,19 @@ func (m *Manager) UpdateOutput(flowID, outputName string, updates *types.Output)
 				return err
 			}
 			flow.UpdatedAt = time.Now()
-			return m.saveFlow(flow)
+			if err := m.saveFlow(flow); err != nil {
+				return err
+			}
+			// Hot-swap: remove old output and add updated one
+			if m.engine.IsRunning(flowID) {
+				_ = m.engine.RemoveOutputFromRunning(flowID, outputName)
+				if o.Status != types.OutputDisabled {
+					if err := m.engine.AddOutputToRunning(flowID, o); err != nil {
+						log.Printf("[flow:%s] hot-swap output %s failed: %v", flowID, outputName, err)
+					}
+				}
+			}
+			return nil
 		}
 	}
 	return fmt.Errorf("output %s not found", outputName)
