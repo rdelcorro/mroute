@@ -59,7 +59,59 @@ Test I starts a MERGE mode flow with only 1 source (port 5520). No data is sent 
 ### 4. Port allocation TOCTOU race
 `allocOutputPort()` binds to port 0 to get a port, then releases it. Between release and actual use, another process could grab the port. This is inherent to the approach but rarely causes issues.
 
+### 5. restartInputIfRunning TOCTOU (not serialized)
+Between `StopFlow` and `StartFlow` in `restartInputIfRunning`, concurrent API calls (AddSource, RemoveSource, DeleteFlow, StartFlow) can race. This is unlikely in practice since source changes are rare admin operations, but a per-flow mutex would make it fully safe.
+
 ## COMPLETED FIXES
+
+### Session 5 (2026-02-19) - Topology Change Coverage + Output Death Recovery
+
+**All 95 tests pass. 0 failures. Real media validated (H.264/AAC via ffprobe).**
+
+**Code fixes (2):**
+
+1. **engine.go: probeSourceAlive missing Setpgid** - The recovery probe's ffprobe process did not set `Setpgid: true`, unlike all other process-spawning functions (input FFmpeg, output FFmpeg, monitor processes). Any child processes spawned by ffprobe during probing would not be killed on context cancellation. Now consistent with engine process management.
+
+2. **engine.go: Dead output FFmpeg goes undetected (CRITICAL)** - When a per-output FFmpeg process dies unexpectedly (e.g., downstream rejects connection), nobody noticed. The relay kept sending UDP packets to a dead port (silently dropped), the output appeared healthy in metrics, and no events were emitted. Added `watchOutputProc` goroutine that:
+   - Detects output FFmpeg death via `proc.Done` channel
+   - Distinguishes unexpected death from deliberate removal (checks `OutputProcs` map)
+   - Emits `output_died` event and marks health as disconnected
+   - Cleans up dead proc from relay and OutputProcs map
+   - Attempts restart with exponential backoff (2s, 4s, 8s) up to 3 times
+   - Emits `output_restarted` or `output_restart_failed`/`output_restart_limit` events
+   - Watcher is started for ALL output FFmpeg processes: initial outputs in `StartFlow`, hot-added outputs in `AddOutputToRunning`, and restarted outputs recursively
+
+**New topology change tests (14 new tests, 81→95):**
+
+3. **D.6: Remove PRIMARY source while running (5 tests)** - Tests removing the primary source from a running flow (not just the backup like D.5). The backup is promoted to primary, flow restarts via `restartInputIfRunning`. Validates: API succeeds (200), flow stays ACTIVE, media resumes on the backup source with valid H.264/AAC (290KB capture).
+
+4. **D.7: UpdateOutput hot-swap while running (5 tests)** - Tests `PUT /v1/flows/{id}/outputs/{name}` to change an output's port while the flow is running. The engine hot-swaps the output (remove old + add new). Validates: API succeeds (200), port is updated in response, media appears on new port with valid H.264/AAC (327KB), old port no longer receives data (0 bytes).
+
+5. **D.8: Start with zero outputs, then hot-add (4 tests)** - Tests the edge case of starting a flow with no outputs, then hot-adding one. The relay and input run without any outputs, then AddOutputToRunning wires up the new output to the relay. Validates: flow creates with 0 outputs (201), flow goes ACTIVE, hot-add API succeeds (200), output receives valid H.264/AAC (332KB).
+
+### Session 4 (2026-02-19) - Hardening Fixes + Test Gaps
+
+**All 81 tests pass. 0 failures. Real media validated (H.264/AAC via ffprobe).**
+
+**Code fixes (4):**
+
+1. **relay.go: AddOutput double-close race with Stop()** - The old connection was closed but the entry remained in the map, allowing Stop() to double-close it. Now the entry is deleted from the map before releasing the lock, preventing Stop() from seeing a stale entry with a closed connection.
+
+2. **engine.go: Dead output FFmpeg not detected during startup** - `startOutputProc` used a blind 300ms sleep before registering with the relay. If FFmpeg died during startup (e.g., bad output URI), the dead process was registered as active. Now uses `select` on `proc.Done` vs `time.After(300ms)` to detect early death and return an error.
+
+3. **engine.go: probeSourceAlive used context.Background()** - The recovery probe's `ffprobe` process was not cancelled when the session context was cancelled, causing up to 2s cleanup delay on flow stop. Now uses the session context as parent, so the probe is killed immediately when the session stops.
+
+4. **monitor.go: Missing Setpgid on monitor processes** - Monitor FFmpeg/ffprobe processes did not set `Setpgid: true`, unlike engine processes. Any child processes spawned by FFmpeg during monitoring would not be killed on context cancellation. Now consistent with engine process management.
+
+**Test improvements (6 new tests, 75→81):**
+
+5. **Hot output add continuity proof** - Captures from existing output CONTINUOUSLY through the add operation (10s capture spanning the add). Proves hitless: 849KB of uninterrupted H.264/AAC with valid 320x240 resolution.
+
+6. **Hot output remove continuity proof** - Same technique: captures from remaining output THROUGH the remove operation. Proves hitless: 875KB of uninterrupted media.
+
+7. **D.5: Hot source remove from running flow (4 tests)** - Previously only tested source removal on stopped flows. Now tests `RemoveSource` on a running flow which triggers `restartInputIfRunning` - validates API succeeds, flow stays ACTIVE, and media resumes (324KB valid H.264/AAC after restart).
+
+8. **Failover post-switch quality fix** - Previous test showed `h264/aac@0x0(15980b)` after failover (0x0 resolution, 15KB - garbage). Added 5s stabilization wait and raised min capture to 20KB. Now shows `h264/aac@320x240(495192b)` - proper resolution, 495KB of real media.
 
 ### Session 3 (2026-02-19) - Critical Code Review Fixes
 
@@ -142,11 +194,12 @@ Tell the user: "Review complete. X tests pass, Y fail. [summary of changes]. Cle
 
 ## LAST RUN RESULTS
 
-**Date**: 2026-02-19
+**Date**: 2026-02-19 (Session 5)
 **Result**: ALL PASS
-**Tests passed**: 75/75 (0 failed, 0 skipped)
+**Tests passed**: 95/95 (0 failed, 0 skipped)
 **Real media validation**: H.264/AAC content verified by ffprobe in all transport tests
-**Features tested**: UDP transport, multi-output fan-out, hot output add, hot output remove, hot source add with failover, SRT listener, SRT encrypted, encryption validation, source failover, MERGE mode, monitoring (thumbnails/metadata/content quality), events, maintenance windows, cache headers, double-stop idempotency, metrics
+**Features tested**: UDP transport, multi-output fan-out, hot output add (with continuity proof), hot output remove (with continuity proof), hot source add with failover, hot source remove while running, **remove primary source while running**, **UpdateOutput hot-swap (port change) while running**, **start with zero outputs then hot-add**, SRT listener, SRT encrypted, encryption validation, source failover (with proper post-switch media validation), MERGE mode, monitoring (thumbnails/metadata/content quality), events, maintenance windows, cache headers, double-stop idempotency, metrics
+**Fixes this session**: 2 code fixes + 14 new tests (probeSourceAlive Setpgid, output death detection + restart watcher, remove primary source topology test, UpdateOutput hot-swap topology test, zero-output start + hot-add topology test)
 
 ## PREVIOUS AGENT NOTES
 

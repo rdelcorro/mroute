@@ -248,9 +248,12 @@ func (e *Engine) StartFlow(flow *types.Flow) error {
 		if out.Status == types.OutputDisabled {
 			continue
 		}
-		if _, err := e.startOutputProc(sess, out); err != nil {
+		proc, err := e.startOutputProc(sess, out)
+		if err != nil {
 			log.Printf("[flow:%s] Failed to start output %s: %v", flowCopy.ID, out.Name, err)
+			continue
 		}
+		go e.watchOutputProc(sess, proc, 0)
 	}
 
 	// Choose session mode based on failover config
@@ -457,7 +460,15 @@ func (e *Engine) startOutputProc(sess *Session, output *types.Output) (*OutputPr
 	sess.mu.Unlock()
 
 	// Brief pause for FFmpeg to bind its UDP listener, then register in relay
-	time.Sleep(300 * time.Millisecond)
+	select {
+	case <-proc.Done:
+		// Process died during startup - clean up and report error
+		sess.mu.Lock()
+		delete(sess.OutputProcs, output.Name)
+		sess.mu.Unlock()
+		return nil, fmt.Errorf("output ffmpeg exited during startup")
+	case <-time.After(300 * time.Millisecond):
+	}
 
 	if err := sess.Relay.AddOutput(output.Name, localPort); err != nil {
 		cancel()
@@ -499,6 +510,83 @@ func (e *Engine) stopOutputProc(sess *Session, name string) {
 	}
 }
 
+const maxOutputRestarts = 3
+
+// watchOutputProc monitors an output FFmpeg process and restarts it if it dies unexpectedly.
+// It detects death via proc.Done, emits events, updates health, and attempts restart with
+// exponential backoff (2s, 4s, 8s) up to maxOutputRestarts times.
+func (e *Engine) watchOutputProc(sess *Session, proc *OutputProc, restartCount int) {
+	select {
+	case <-proc.Done:
+	case <-sess.Ctx.Done():
+		return
+	}
+
+	// Session shutting down - expected death, don't restart
+	if sess.Ctx.Err() != nil {
+		return
+	}
+
+	// Check if this was a deliberate removal (stopOutputProc deletes from map before killing)
+	sess.mu.RLock()
+	_, stillExists := sess.OutputProcs[proc.Name]
+	sess.mu.RUnlock()
+	if !stillExists {
+		return
+	}
+
+	e.emit(sess.FlowID, "output_died",
+		fmt.Sprintf("Output %s FFmpeg exited unexpectedly", proc.Name), "warning")
+
+	// Mark as disconnected
+	sess.mu.Lock()
+	if oh, ok := sess.OutputHealth[proc.Name]; ok {
+		oh.Connected = false
+		oh.Disconnections++
+	}
+	sess.mu.Unlock()
+
+	// Clean up dead proc from relay and map
+	if sess.Relay != nil {
+		sess.Relay.RemoveOutput(proc.Name)
+	}
+	sess.mu.Lock()
+	delete(sess.OutputProcs, proc.Name)
+	sess.mu.Unlock()
+
+	if restartCount >= maxOutputRestarts {
+		e.emit(sess.FlowID, "output_restart_limit",
+			fmt.Sprintf("Output %s exceeded restart limit (%d), giving up", proc.Name, maxOutputRestarts),
+			"error")
+		return
+	}
+
+	// Exponential backoff: 2s, 4s, 8s
+	delay := time.Duration(2<<uint(restartCount)) * time.Second
+	select {
+	case <-time.After(delay):
+	case <-sess.Ctx.Done():
+		return
+	}
+
+	if sess.Ctx.Err() != nil {
+		return
+	}
+
+	newProc, err := e.startOutputProc(sess, proc.Output)
+	if err != nil {
+		e.emit(sess.FlowID, "output_restart_failed",
+			fmt.Sprintf("Failed to restart output %s: %v", proc.Name, err), "error")
+		return
+	}
+
+	e.emit(sess.FlowID, "output_restarted",
+		fmt.Sprintf("Output %s restarted (attempt %d/%d)", proc.Name, restartCount+1, maxOutputRestarts),
+		"info")
+
+	go e.watchOutputProc(sess, newProc, restartCount+1)
+}
+
 // AddOutputToRunning hot-adds an output to a running flow without interrupting other outputs or the input
 func (e *Engine) AddOutputToRunning(flowID string, output *types.Output) error {
 	e.mu.Lock()
@@ -517,6 +605,8 @@ func (e *Engine) AddOutputToRunning(flowID string, output *types.Output) error {
 	sess.mu.Lock()
 	sess.OutputHealth[output.Name] = &OutputHealth{Name: output.Name}
 	sess.mu.Unlock()
+
+	go e.watchOutputProc(sess, proc, 0)
 
 	e.emit(flowID, "output_added", fmt.Sprintf("Hot-added output %s (relay port %d)", output.Name, proc.LocalPort), "info")
 	return nil
@@ -819,7 +909,7 @@ func (e *Engine) probeForPrimaryRecovery(sess *Session, primaryName string) {
 			continue
 		}
 
-		if e.probeSourceAlive(primarySource, 2*time.Second) {
+		if e.probeSourceAlive(sess.Ctx, primarySource, 2*time.Second) {
 			e.emit(sess.FlowID, "primary_recovered",
 				fmt.Sprintf("Primary source %s recovered, switching back", primaryName), "info")
 
@@ -838,8 +928,8 @@ func (e *Engine) probeForPrimaryRecovery(sess *Session, primaryName string) {
 }
 
 // probeSourceAlive checks if a source is delivering data by running a quick ffprobe
-func (e *Engine) probeSourceAlive(source *types.Source, timeout time.Duration) bool {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+func (e *Engine) probeSourceAlive(parent context.Context, source *types.Source, timeout time.Duration) bool {
+	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 
 	uri := source.BuildSourceURI()
@@ -849,6 +939,7 @@ func (e *Engine) probeSourceAlive(source *types.Source, timeout time.Duration) b
 		"-probesize", "32768",
 		"-i", uri,
 	)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	err := cmd.Run()
 	return err == nil
 }

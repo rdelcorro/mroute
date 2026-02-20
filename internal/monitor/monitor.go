@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/openclaw/mroute/pkg/types"
@@ -227,6 +228,7 @@ func (m *Monitor) probeMetadata(sess *MonitorSession) {
 
 		ctx, cancel := context.WithTimeout(sess.ctx, 10*time.Second)
 		cmd := exec.CommandContext(ctx, m.ffprobePath, args...)
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 		out, err := cmd.Output()
 		cancel()
 
@@ -286,6 +288,7 @@ func (m *Monitor) runThumbnailCapture(sess *MonitorSession, intervalSec int) {
 
 		ctx, cancel := context.WithTimeout(sess.ctx, 10*time.Second)
 		cmd := exec.CommandContext(ctx, m.ffmpegPath, args...)
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 		err := cmd.Run()
 		cancel()
 
@@ -337,6 +340,7 @@ func (m *Monitor) runContentQuality(sess *MonitorSession) {
 
 		ctx, cancel := context.WithTimeout(sess.ctx, 15*time.Second)
 		cmd := exec.CommandContext(ctx, m.ffmpegPath, args...)
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 		stderr, err := cmd.StderrPipe()
 		if err != nil {
 			cancel()

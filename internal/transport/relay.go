@@ -88,11 +88,18 @@ func (r *PacketRelay) AddOutput(name string, localPort int) error {
 		r.mu.Unlock()
 		return fmt.Errorf("relay is stopped")
 	}
-	// Close existing connection for this name to avoid leaking
+	// Remove existing entry to avoid double-close if Stop() races with us
+	var oldConn *net.UDPConn
 	if old, exists := r.outputs[name]; exists {
-		old.conn.Close()
+		oldConn = old.conn
+		delete(r.outputs, name)
 	}
 	r.mu.Unlock()
+
+	// Close old connection outside the lock
+	if oldConn != nil {
+		oldConn.Close()
+	}
 
 	addr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: localPort}
 	conn, err := net.DialUDP("udp", nil, addr)

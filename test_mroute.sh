@@ -551,6 +551,13 @@ sleep 5
 capture_udp 6150 "$TEST_TMPDIR/hot_before.ts" 4
 check_media "hot-add: original output working" "$TEST_TMPDIR/hot_before.ts" 3000
 
+# CONTINUITY TEST: Start capturing from original output BEFORE adding the new output.
+# This capture runs THROUGH the add operation to prove the existing output is not interrupted.
+capture_udp 6150 "$TEST_TMPDIR/hot_continuity.ts" 10 &
+PID_CONT=$!
+
+sleep 1
+
 # Add a second output while flow is running (hitless - no restart needed)
 RESP=$(curl -s -w "\n%{http_code}" -X POST "$BASE/v1/flows/$HOT_OUT_ID/outputs" -H "Content-Type: application/json" -d '{
   "name": "hot_added",
@@ -560,8 +567,14 @@ RESP=$(curl -s -w "\n%{http_code}" -X POST "$BASE/v1/flows/$HOT_OUT_ID/outputs" 
 }')
 check "hot-add output API" "200" "$(echo "$RESP" | tail -1)"
 
-# Wait for output FFmpeg to start and begin receiving from relay
-sleep 3
+# Wait for the new output FFmpeg to start, then verify both outputs
+sleep 4
+
+# Wait for continuity capture to finish
+wait $PID_CONT 2>/dev/null
+
+# Validate the continuity capture - should have ~10s of uninterrupted media
+check_media "hot-add: original output uninterrupted during add" "$TEST_TMPDIR/hot_continuity.ts" 50000
 
 # Verify BOTH outputs now receive data
 capture_udp 6150 "$TEST_TMPDIR/hot_orig.ts" 4 &
@@ -612,14 +625,25 @@ wait $PID_KP 2>/dev/null
 wait $PID_GP 2>/dev/null
 check_media "hot-rm: both outputs before remove" "$TEST_TMPDIR/hot_rm_keep_before.ts" 3000
 
+# CONTINUITY TEST: Start capturing from the "keep" output BEFORE removing the other output.
+# This proves the remaining output is not interrupted by the remove operation.
+capture_udp 6160 "$TEST_TMPDIR/hot_rm_continuity.ts" 10 &
+PID_RM_CONT=$!
+
+sleep 1
+
 # Remove one output while running (hitless - no restart needed)
 RESP=$(curl -s -w "\n%{http_code}" -X DELETE "$BASE/v1/flows/$HOT_RM_ID/outputs/remove_me")
 check "hot-rm output API" "200" "$(echo "$RESP" | tail -1)"
 
-# Brief wait for relay to stop sending to removed output
-sleep 2
+# Wait for continuity capture to finish
+wait $PID_RM_CONT 2>/dev/null
 
-# Verify remaining output still works
+# Validate the continuity capture - should have ~10s of uninterrupted media
+check_media "hot-rm: remaining output uninterrupted during remove" "$TEST_TMPDIR/hot_rm_continuity.ts" 50000
+
+# Brief wait then verify remaining output still works
+sleep 1
 capture_udp 6160 "$TEST_TMPDIR/hot_rm_keep_after.ts" 4
 check_media "hot-rm: remaining output after remove" "$TEST_TMPDIR/hot_rm_keep_after.ts"
 
@@ -698,6 +722,226 @@ curl -s -X POST "$BASE/v1/flows/$HOT_SRC_ID/stop" -o /dev/null
 sleep 1
 bg_kill "$HOT_SRC_BAK"
 curl -s -X DELETE "$BASE/v1/flows/$HOT_SRC_ID" -o /dev/null
+
+# ============================================================================
+# D.5 Hot Source Remove (remove failover source while running)
+# ============================================================================
+
+echo ""
+echo -e "${YEL}[D.5] Hot Source Remove (remove while running)${NC}"
+bg_killall
+
+RESP=$(curl -s -w "\n%{http_code}" -X POST "$BASE/v1/flows" -H "Content-Type: application/json" -d '{
+  "name": "Hot Source Remove",
+  "source": {"name":"primary","protocol":"udp","ingest_port":5180},
+  "outputs": [{"name":"out","protocol":"udp","destination":"127.0.0.1","port":6180}],
+  "source_failover_config": {
+    "state": "ENABLED",
+    "failover_mode": "FAILOVER",
+    "source_priority": {"primary_source": "primary"}
+  }
+}')
+HOT_SRM_ID=$(echo "$RESP" | sed '$d' | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
+
+# Add backup source (while stopped, so flow has 2 sources)
+curl -s -X POST "$BASE/v1/flows/$HOT_SRM_ID/source" -H "Content-Type: application/json" \
+  -d '{"name":"backup","protocol":"udp","ingest_port":5181}' -o /dev/null
+
+# Start primary sender
+HOT_SRM_PRI=$(start_udp_source 5180 500k 440)
+sleep 2
+
+# Start flow with 2 sources
+curl -s -X POST "$BASE/v1/flows/$HOT_SRM_ID/start" -o /dev/null
+sleep 4
+
+# Verify flow is running with media
+capture_udp 6180 "$TEST_TMPDIR/hot_srm_before.ts" 3
+check_media "hot-src-rm: media before source remove" "$TEST_TMPDIR/hot_srm_before.ts" 3000
+
+# Remove backup source while flow is running (triggers restartInputIfRunning)
+RESP=$(curl -s -w "\n%{http_code}" -X DELETE "$BASE/v1/flows/$HOT_SRM_ID/source/backup")
+check "hot-src-rm: remove source API" "200" "$(echo "$RESP" | tail -1)"
+
+# Wait for restart to complete
+sleep 5
+
+# Verify flow is still running on primary with good media
+FLOW_ST=$(curl -s "$BASE/v1/flows/$HOT_SRM_ID" | python3 -c "import sys,json; print(json.load(sys.stdin)['status'])" 2>/dev/null)
+check "hot-src-rm: flow still ACTIVE after remove" "ACTIVE" "$FLOW_ST"
+
+capture_udp 6180 "$TEST_TMPDIR/hot_srm_after.ts" 4
+check_media "hot-src-rm: media after source remove" "$TEST_TMPDIR/hot_srm_after.ts" 20000
+
+curl -s -X POST "$BASE/v1/flows/$HOT_SRM_ID/stop" -o /dev/null
+sleep 1
+bg_kill "$HOT_SRM_PRI"
+curl -s -X DELETE "$BASE/v1/flows/$HOT_SRM_ID" -o /dev/null
+
+# ============================================================================
+# D.6 Remove PRIMARY Source While Running
+# ============================================================================
+
+echo ""
+echo -e "${YEL}[D.6] Remove PRIMARY Source While Running${NC}"
+bg_killall
+
+RESP=$(curl -s -w "\n%{http_code}" -X POST "$BASE/v1/flows" -H "Content-Type: application/json" -d '{
+  "name": "Remove Primary Source",
+  "source": {"name":"primary","protocol":"udp","ingest_port":5190},
+  "outputs": [{"name":"out","protocol":"udp","destination":"127.0.0.1","port":6190}],
+  "source_failover_config": {
+    "state": "ENABLED",
+    "failover_mode": "FAILOVER",
+    "source_priority": {"primary_source": "primary"}
+  }
+}')
+RM_PRI_ID=$(echo "$RESP" | sed '$d' | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
+
+# Add backup source (while stopped)
+curl -s -X POST "$BASE/v1/flows/$RM_PRI_ID/source" -H "Content-Type: application/json" \
+  -d '{"name":"backup","protocol":"udp","ingest_port":5191}' -o /dev/null
+
+# Start BOTH source generators
+RM_PRI_SRC1=$(start_udp_source 5190 500k 440)
+RM_PRI_SRC2=$(start_udp_source 5191 500k 880)
+sleep 2
+
+# Start flow (primary is active)
+curl -s -X POST "$BASE/v1/flows/$RM_PRI_ID/start" -o /dev/null
+sleep 4
+
+# Verify primary is active and media flows
+ACTIVE_BEFORE=$(curl -s "$BASE/v1/flows/$RM_PRI_ID/metrics" | python3 -c "import sys,json; print(json.load(sys.stdin)['active_source'])" 2>/dev/null)
+check "rm-primary: primary is active" "primary" "$ACTIVE_BEFORE"
+
+capture_udp 6190 "$TEST_TMPDIR/rm_pri_before.ts" 3
+check_media "rm-primary: media before removal" "$TEST_TMPDIR/rm_pri_before.ts" 3000
+
+# Remove the PRIMARY source while running (backup should become new primary)
+RESP=$(curl -s -w "\n%{http_code}" -X DELETE "$BASE/v1/flows/$RM_PRI_ID/source/primary")
+check "rm-primary: remove primary API" "200" "$(echo "$RESP" | tail -1)"
+
+# Wait for restart to complete
+sleep 6
+
+# Verify flow is still ACTIVE with the backup as the sole source
+FLOW_ST=$(curl -s "$BASE/v1/flows/$RM_PRI_ID" | python3 -c "import sys,json; print(json.load(sys.stdin)['status'])" 2>/dev/null)
+check "rm-primary: flow still ACTIVE" "ACTIVE" "$FLOW_ST"
+
+# Verify media still flows from the backup (now promoted to primary)
+capture_udp 6190 "$TEST_TMPDIR/rm_pri_after.ts" 4
+check_media "rm-primary: media after primary removal" "$TEST_TMPDIR/rm_pri_after.ts" 20000
+
+curl -s -X POST "$BASE/v1/flows/$RM_PRI_ID/stop" -o /dev/null
+sleep 1
+bg_kill "$RM_PRI_SRC1" "$RM_PRI_SRC2"
+curl -s -X DELETE "$BASE/v1/flows/$RM_PRI_ID" -o /dev/null
+
+# ============================================================================
+# D.7 UpdateOutput Hot-Swap While Running (change port)
+# ============================================================================
+
+echo ""
+echo -e "${YEL}[D.7] UpdateOutput Hot-Swap (change port while running)${NC}"
+bg_killall
+
+RESP=$(curl -s -w "\n%{http_code}" -X POST "$BASE/v1/flows" -H "Content-Type: application/json" -d '{
+  "name": "Hot Swap Output",
+  "source": {"name":"src","protocol":"udp","ingest_port":5210},
+  "outputs": [
+    {"name":"swappable","protocol":"udp","destination":"127.0.0.1","port":6210}
+  ]
+}')
+SWAP_ID=$(echo "$RESP" | sed '$d' | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
+
+SWAP_SRC=$(start_udp_source 5210)
+sleep 2
+
+curl -s -X POST "$BASE/v1/flows/$SWAP_ID/start" -o /dev/null
+sleep 4
+
+# Verify original port works
+capture_udp 6210 "$TEST_TMPDIR/swap_before.ts" 3
+check_media "hot-swap: media on original port 6210" "$TEST_TMPDIR/swap_before.ts" 3000
+
+# Update output to different port (hot-swap: remove old + add new)
+RESP=$(curl -s -w "\n%{http_code}" -X PUT "$BASE/v1/flows/$SWAP_ID/outputs/swappable" \
+  -H "Content-Type: application/json" -d '{"port": 6211}')
+check "hot-swap: update output API" "200" "$(echo "$RESP" | tail -1)"
+
+# Verify updated port in response
+UPDATED_PORT=$(echo "$RESP" | sed '$d' | python3 -c "import sys,json; f=json.load(sys.stdin); print([o['port'] for o in f['outputs'] if o['name']=='swappable'][0])" 2>/dev/null)
+check "hot-swap: port updated to 6211" "6211" "$UPDATED_PORT"
+
+sleep 3
+
+# Verify media on NEW port
+capture_udp 6211 "$TEST_TMPDIR/swap_after.ts" 4
+check_media "hot-swap: media on new port 6211" "$TEST_TMPDIR/swap_after.ts"
+
+# Verify OLD port no longer receives
+capture_udp 6210 "$TEST_TMPDIR/swap_old.ts" 3 6000000
+TOTAL=$((TOTAL+1))
+OLD_SIZE=$(file_size "$TEST_TMPDIR/swap_old.ts" 2>/dev/null || echo 0)
+if [ "${OLD_SIZE:-0}" -lt 1000 ]; then
+    echo -e "  ${GREEN}PASS${NC} hot-swap: old port 6210 no longer receives (${OLD_SIZE}b)"
+    PASS=$((PASS+1))
+else
+    echo -e "  ${RED}FAIL${NC} hot-swap: old port 6210 still receiving (${OLD_SIZE}b)"
+    FAIL=$((FAIL+1))
+fi
+
+curl -s -X POST "$BASE/v1/flows/$SWAP_ID/stop" -o /dev/null
+sleep 1
+bg_kill "$SWAP_SRC"
+curl -s -X DELETE "$BASE/v1/flows/$SWAP_ID" -o /dev/null
+
+# ============================================================================
+# D.8 Start With Zero Outputs, Then Hot-Add
+# ============================================================================
+
+echo ""
+echo -e "${YEL}[D.8] Start With Zero Outputs, Then Hot-Add${NC}"
+bg_killall
+
+RESP=$(curl -s -w "\n%{http_code}" -X POST "$BASE/v1/flows" -H "Content-Type: application/json" -d '{
+  "name": "Zero Outputs",
+  "source": {"name":"src","protocol":"udp","ingest_port":5220},
+  "outputs": []
+}')
+ZERO_ID=$(echo "$RESP" | sed '$d' | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
+check "zero-out: flow created with 0 outputs" "201" "$(echo "$RESP" | tail -1)"
+
+ZERO_SRC=$(start_udp_source 5220)
+sleep 2
+
+# Start flow with no outputs (relay runs, input feeds into relay, but nothing reads from it)
+curl -s -X POST "$BASE/v1/flows/$ZERO_ID/start" -o /dev/null
+sleep 3
+
+FLOW_ST=$(curl -s "$BASE/v1/flows/$ZERO_ID" | python3 -c "import sys,json; print(json.load(sys.stdin)['status'])" 2>/dev/null)
+check "zero-out: flow ACTIVE with 0 outputs" "ACTIVE" "$FLOW_ST"
+
+# Hot-add an output to the running flow
+RESP=$(curl -s -w "\n%{http_code}" -X POST "$BASE/v1/flows/$ZERO_ID/outputs" -H "Content-Type: application/json" -d '{
+  "name": "late_added",
+  "protocol": "udp",
+  "destination": "127.0.0.1",
+  "port": 6220
+}')
+check "zero-out: hot-add output API" "200" "$(echo "$RESP" | tail -1)"
+
+sleep 4
+
+# Verify the hot-added output receives valid media
+capture_udp 6220 "$TEST_TMPDIR/zero_out.ts" 4
+check_media "zero-out: hot-added output receives media" "$TEST_TMPDIR/zero_out.ts"
+
+curl -s -X POST "$BASE/v1/flows/$ZERO_ID/stop" -o /dev/null
+sleep 1
+bg_kill "$ZERO_SRC"
+curl -s -X DELETE "$BASE/v1/flows/$ZERO_ID" -o /dev/null
 
 # ============================================================================
 # E. SRT Listener Transport (real media validation)
@@ -878,9 +1122,12 @@ else
     FAIL=$((FAIL+1))
 fi
 
-# Capture output after failover to verify data is still flowing
-capture_udp 6300 "$TEST_TMPDIR/fo_after.ts" 5
-check_media "failover: media flowing after switch" "$TEST_TMPDIR/fo_after.ts"
+# Wait for new input FFmpeg to stabilize on backup source before capturing
+sleep 5
+
+# Capture output after failover to verify data is still flowing with proper media
+capture_udp 6300 "$TEST_TMPDIR/fo_after.ts" 6
+check_media "failover: media flowing after switch" "$TEST_TMPDIR/fo_after.ts" 20000
 
 curl -s -X POST "$BASE/v1/flows/$FO_ID/stop" -o /dev/null
 sleep 1
